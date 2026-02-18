@@ -48,13 +48,13 @@ INITIAL_SOLUTIONS = {
         'number': 2,
         'name': 'Acidic Source',
         'pH': 3.0,
-        'components': {'Cl': 1000.0}  # 作为HCl
+        'components': {'Cl': [1000.0, "HCl"]}  # 作为HCl
     },
     'alkaline': {
         'number': 3,
         'name': 'Alkaline Source',
         'pH': 11.0,
-        'components': {'Na': 1000.0}  # 作为NaOH
+        'components': {'Na': [1000.0, "NaOH"]} # 作为NaOH，单位mg/L
     }
 }
 
@@ -73,7 +73,8 @@ def initialize_phreeqcrm():
     rm.SetErrorOn(True)
     rm.SetErrorHandlerMode(1)
     rm.SetPrintChemistryOn(False, False, False)
-    rm.OpenFiles()
+    # 安全性优化：注释掉OpenFiles避免权限问题
+    # rm.OpenFiles()
     
     # 优化并行计算设置
     rm.SetRebalanceByCell(True)
@@ -163,13 +164,13 @@ def get_solution_definition():
     """
     solution_input = ""
     
-    # 定义三种溶液
+    # `定义三种溶液`
     for sol_key, sol_config in INITIAL_SOLUTIONS.items():
         solution_input += f"SOLUTION {sol_config['number']} {sol_config['name']}\n"
         solution_input += f"    units mg/L; temp {TEMPERATURE}; pH {sol_config['pH']}; water 1.0\n"
         # 添加组件（如果有）
         for component, concentration in sol_config.get('components', {}).items():
-            solution_input += f"    {component} {concentration}.0\n"
+            solution_input += f"    {component} {concentration[0]} as {concentration[1]} charge\n"
         solution_input += "END\n"
     
     # 添加SELECTED_OUTPUT配置

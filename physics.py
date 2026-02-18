@@ -8,55 +8,110 @@ import time
 from scipy.ndimage import convolve
 from utils import NX, NY, NZ, NXYZ, DIFFUSION_COEFFICIENT
 
-def apply_diffusion_vectorized(c_flat, ncomps, nx=NX, ny=NY, nz=NZ, diffusion_coeff=DIFFUSION_COEFFICIENT):
+
+# physics.py - 内存安全版本
+def apply_diffusion_vectorized_inplace(c_in, c_out, ncomps, nx=NX, ny=NY, nz=NZ, diffusion_coeff=DIFFUSION_COEFFICIENT):
     """
-    向量化的3D扩散计算 - 使用卷积操作替代嵌套循环
+    原地向量化的 3D 扩散计算 - 内存安全版本
     
     Args:
-        c_flat (list): 扁平化的浓度数组
+        c_in (np.ndarray): 输入浓度数组，形状 (ncomps, nxyz)，float64，C连续
+        c_out (np.ndarray): 输出浓度数组，形状 (ncomps, nxyz)，float64，C连续
         ncomps (int): 组件数量
-        nx (int): X方向网格数
-        ny (int): Y方向网格数
-        nz (int): Z方向网格数
+        nx, ny, nz: 网格维度
         diffusion_coeff (float): 扩散系数
+    
+    注意：
+    - 所有数组必须预先分配且持久存在
+    - 不创建临时对象，避免内存碎片
+    - 原地写入，提高性能和稳定性
+    """
+    # 验证输入参数
+    nxyz = nx * ny * nz
+    expected_size = ncomps * nxyz
+    
+    if c_in.size != expected_size or c_out.size != expected_size:
+        raise RuntimeError(f"缓冲区大小不匹配: 期望 {expected_size}, 输入 {c_in.size}, 输出 {c_out.size}")
+    
+    if c_in.dtype != np.float64 or c_out.dtype != np.float64:
+        raise RuntimeError("缓冲区必须为 float64 类型")
+    
+    if not c_in.flags['C_CONTIGUOUS'] or not c_out.flags['C_CONTIGUOUS']:
+        raise RuntimeError("缓冲区必须为 C 连续内存布局")
+    
+    # 创建视图而不复制数据
+    c_in_view = c_in.reshape((ncomps, nz, ny, nx))
+    c_out_view = c_out.reshape((ncomps, nz, ny, nx))
+    
+    # 定义拉普拉斯算子核
+    kernel = np.array([
+        [[0, 0, 0], [0, 1, 0], [0, 0, 0]],
+        [[0, 1, 0], [1, -6, 1], [0, 1, 0]],
+        [[0, 0, 0], [0, 1, 0], [0, 0, 0]]
+    ], dtype=np.float64) / 6.0
+    
+    start_time = time.time()
+    
+    # 对每个组件执行扩散计算
+    for comp_idx in range(ncomps):
+        # 获取当前组件的3D网格
+        grid_current = c_in_view[comp_idx]
         
-    Returns:
-        tuple: (新的浓度数组, 计算时间)
+        # 计算拉普拉斯算子
+        laplacian = convolve(grid_current, kernel, mode='nearest')
+        
+        # 应用扩散方程：c_new = c_old + D * laplacian
+        grid_new = grid_current + diffusion_coeff * laplacian
+        
+        # 确保非负性
+        np.maximum(grid_new, 0.0, out=grid_new)
+        
+        # 写入输出缓冲区
+        c_out_view[comp_idx] = grid_new
+    
+    computation_time = time.time() - start_time
+    
+    # 验证输出数据的有效性
+    if not np.isfinite(c_out).all():
+        raise RuntimeError(f"扩散计算产生非有限值，在时间 {computation_time:.6f}s")
+    
+    return computation_time
+
+def apply_diffusion_vectorized(c_flat, ncomps, nx=NX, ny=NY, nz=NZ, diffusion_coeff=DIFFUSION_COEFFICIENT):
+    """
+    向量化的 3D 扩散计算 - 兼容旧接口
+    返回：扁平列表 [comp0_cell0, comp0_cell1, ..., comp1_cell0, ...]
     """
     nxyz = nx * ny * nz
-    c_data = np.array(c_flat, dtype=float).reshape((ncomps, nxyz))
+    c_data = np.array(c_flat, dtype=np.float64).reshape((ncomps, nxyz))
     c_new = np.empty_like(c_data)
 
-    # 创建3D卷积核 (7点 stencil)
-    kernel = np.zeros((3, 3, 3))
-    kernel[1, 1, 0] = 1  # -z方向
-    kernel[1, 0, 1] = 1  # -y方向
-    kernel[0, 1, 1] = 1  # -x方向
-    kernel[2, 1, 1] = 1  # +x方向
-    kernel[1, 2, 1] = 1  # +y方向
-    kernel[1, 1, 2] = 1  # +z方向
-    kernel[1, 1, 1] = -6  # 中心点
-    kernel /= 6.0  # 归一化
+    kernel = np.zeros((3, 3, 3), dtype=np.float64)
+    kernel[1, 1, 0] = 1
+    kernel[1, 0, 1] = 1
+    kernel[0, 1, 1] = 1
+    kernel[2, 1, 1] = 1
+    kernel[1, 2, 1] = 1
+    kernel[1, 1, 2] = 1
+    kernel[1, 1, 1] = -6
+    kernel /= 6.0
 
     start_time = time.time()
 
     for comp_idx in range(ncomps):
-        # 重塑为3D网格
         grid_3d = c_data[comp_idx, :].reshape((nz, ny, nx))
-
-        # 使用卷积计算拉普拉斯算子
-        laplacian = convolve(grid_3d, kernel, mode='constant', cval=0.0)
-
-        # 更新浓度 (显式欧拉方法)
+        laplacian = convolve(grid_3d, kernel, mode='nearest')
         grid_new_3d = grid_3d + diffusion_coeff * laplacian
-
-        # 非负约束
-        grid_new_3d = np.maximum(grid_new_3d, 0)
-
+        grid_new_3d = np.maximum(grid_new_3d, 0.0).astype(np.float64)
         c_new[comp_idx] = grid_new_3d.flatten()
 
     computation_time = time.time() - start_time
-    return c_new.flatten().tolist(), computation_time
+
+    # 🔥 关键：返回扁平列表，长度 = ncomps × nxyz
+    c_new_flat = c_new.flatten().astype(np.float64)
+    c_new_list = [float(v) for v in c_new_flat]
+
+    return c_new_list, computation_time
 
 def calculate_concentration_gradient(concentrations, nx=NX, ny=NY, nz=NZ):
     """

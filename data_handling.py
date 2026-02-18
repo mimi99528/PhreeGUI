@@ -8,7 +8,8 @@ from utils import NX, NY, NZ, NXYZ
 
 def get_ph_data(rm, nx=NX, ny=NY, nz=NZ):
     """
-    鲁棒的 pH 获取函数，专门处理只有pH的Selected Output (3D版本)
+    鲁棒的 pH 获取函数 - 🔥 增强版数据验证
+    专门处理只有pH的Selected Output (3D版本)
     
     Args:
         rm: PhreeqcRM实例
@@ -19,50 +20,83 @@ def get_ph_data(rm, nx=NX, ny=NY, nz=NZ):
     Returns:
         np.ndarray: 3D pH矩阵 (nz, ny, nx)
     """
-    rm.SetCurrentSelectedOutputUserNumber(1)
-    
-    # 获取表头，了解返回了哪些变量
-    headings = rm.GetSelectedOutputHeadings()
-    print(f"   输出变量: {headings}")
-    n_vars = len(headings)
-    
-    # 获取所有数据 (一维长数组)
-    data = rm.GetSelectedOutput()
-    
-    if data is None or len(data) == 0:
-        print("   [错误] 未获取到 Selected Output 数据")
-        return np.full((nz, ny, nx), 7.0)  # 返回默认中性pH的3D数组
-    
-    # 验证数据长度
-    expected_length = NXYZ * n_vars
-    if len(data) != expected_length:
-        print(f"   [警告] 数据长度不匹配 (期望: {expected_length}, 实际: {len(data)})")
-        return np.full((nz, ny, nx), 7.0)  # 返回默认中性pH的3D数组
-    
-    # 找到 'pH' 所在的列索引
     try:
-        ph_index = list(headings).index('pH')
-    except ValueError:
-        print(f"   [错误] 在输出变量中找不到 'pH'。可用变量: {headings}")
-        return np.full((nz, ny, nx), 7.0)  # 返回默认中性pH的3D数组
-    
-    # 从长数组中提取所有单元格的 pH 值
-    # 数据是这样排列的: [var1_c0, var2_c0, ..., pH_c0, ..., var1_c1, var2_c1, ...]
-    ph_values = []
-    for i in range(0, len(data), n_vars):
-        ph_val = data[i + ph_index]
-        # 处理无效值
-        if ph_val is None or np.isnan(ph_val) or ph_val < 0 or ph_val > 14:
-            ph_val = 7.0  # 默认中性pH
-        ph_values.append(ph_val)
-    
-    # 重塑为 3D矩阵 (Z, Y, X顺序)
-    ph_matrix_3d = np.array(ph_values).reshape((nz, ny, nx))
-    
-    # 验证pH值合理性
-    ph_matrix_3d = np.clip(ph_matrix_3d, 0, 14)  # 限制在合理pH范围内
-    
-    return ph_matrix_3d
+        rm.SetCurrentSelectedOutputUserNumber(1)
+        
+        # 获取表头，了解返回了哪些变量
+        headings = rm.GetSelectedOutputHeadings()
+        n_vars = len(headings)
+        
+        # 🔥 关键验证：检查表头完整性
+        if headings is None or len(headings) == 0:
+            print("   [严重错误] Selected Output 表头为空")
+            return np.full((nz, ny, nx), 7.0, dtype=np.float64)
+        
+        # 获取所有数据 (一维长数组)
+        data = rm.GetSelectedOutput()
+        
+        # 🔥 关键验证：数据完整性检查
+        if data is None:
+            print("   [严重错误] Selected Output 数据为 None")
+            return np.full((nz, ny, nx), 7.0, dtype=np.float64)
+        
+        if len(data) == 0:
+            print("   [严重错误] Selected Output 数据为空数组")
+            return np.full((nz, ny, nx), 7.0, dtype=np.float64)
+        
+        # 验证数据长度
+        expected_length = NXYZ * n_vars
+        if len(data) != expected_length:
+            print(f"   [严重错误] 数据长度不匹配 (期望: {expected_length}, 实际: {len(data)})")
+            return np.full((nz, ny, nx), 7.0, dtype=np.float64)
+        
+        # 找到 'pH' 所在的列索引
+        try:
+            ph_index = list(headings).index('pH')
+        except ValueError:
+            print(f"   [严重错误] 在输出变量中找不到 'pH'。可用变量: {headings}")
+            return np.full((nz, ny, nx), 7.0, dtype=np.float64)
+        
+        # 🔥 性能优化：预分配数组
+        ph_values = np.empty(NXYZ, dtype=np.float64)
+        
+        # 从长数组中提取所有单元格的 pH 值
+        # 数据排列: [var1_c0, var2_c0, ..., pH_c0, ..., var1_c1, var2_c1, ...]
+        for i in range(NXYZ):
+            idx = i * n_vars + ph_index
+            ph_val = data[idx]
+            
+            # 🔥 增强的数据验证
+            if ph_val is None:
+                ph_val = 7.0
+            elif isinstance(ph_val, (int, float)):
+                if np.isnan(ph_val) or np.isinf(ph_val):
+                    ph_val = 7.0
+                elif ph_val < 0 or ph_val > 14:
+                    ph_val = 7.0  # 限制在合理pH范围内
+            else:
+                ph_val = 7.0  # 类型不匹配时使用默认值
+                
+            ph_values[i] = ph_val
+        
+        # 重塑为 3D矩阵 (Z, Y, X顺序)
+        ph_matrix_3d = ph_values.reshape((nz, ny, nx))
+        
+        # 🔥 最终验证：确保返回数据的有效性
+        if not np.isfinite(ph_matrix_3d).all():
+            print("   [警告] pH数据包含非有限值，已替换为默认值")
+            ph_matrix_3d = np.nan_to_num(ph_matrix_3d, nan=7.0, posinf=14.0, neginf=0.0)
+        
+        # 确保数据类型和范围正确
+        ph_matrix_3d = ph_matrix_3d.astype(np.float64)
+        ph_matrix_3d = np.clip(ph_matrix_3d, 0, 14)
+        
+        return ph_matrix_3d
+        
+    except Exception as e:
+        print(f"   [致命错误] get_ph_data执行异常: {e}")
+        # 发生异常时返回安全的默认数据
+        return np.full((nz, ny, nx), 7.0, dtype=np.float64)
 
 def print_grid_state(rm, nx=NX, ny=NY, nz=NZ, label="Grid State"):
     """
