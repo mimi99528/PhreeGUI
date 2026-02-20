@@ -21,7 +21,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, Slot, QObject
 from PySide6.QtGui import QFont
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
-use_ssfr = False
+use_ssfr = True
 # ModernGL for OpenGL rendering
 import moderngl
 from moderngl_window import WindowConfig
@@ -87,6 +87,9 @@ MAX_PARTICLES = 15000
 H = PARTICLE_RADIUS * 2.0
 GRID_REBUILD_INTERVAL = 1
 MC_MESH_UPDATE_INTERVAL = 1
+
+# SSFR shadow map resolution (fixed size for consistent quality & performance)
+SHADOW_MAP_SIZE = 512
 
 # Performance optimization constants
 BATCH_SIZE = 1000  # 批量处理大小
@@ -512,50 +515,33 @@ class MeshSystem:
     def step_simulation(self, dt: float = 0.008) -> Tuple[List, List]:
         """Execute one simulation step with boundary handling"""
         self.current_frame += 1
-        
-        # Time tracking for each step
-        step_start = time.perf_counter()
-        
-        # Use PySPlisHSPlasH for physics simulation
+
+        # Physics simulation
         forces_start = time.perf_counter()
         self.compute_forces()
-        forces_time = time.perf_counter() - forces_start
-        print(f"Force computation time: {forces_time*1000:.2f}ms")
-        
-        # Sync particle data
-        sync_start = time.perf_counter()
+        self.performance_stats['force_computation_time'] = time.perf_counter() - forces_start
+
+        # Sync particle data from SPH solver
         self.sync_particle_data()
-        sync_time = time.perf_counter() - sync_start
-        print(f"Particle data sync time: {sync_time*1000:.2f}ms")
-        
+
         # Apply boundary collision handling
-        boundary_start = time.perf_counter()
         self._apply_manual_boundary_collision()
-        boundary_time = time.perf_counter() - boundary_start
-        print(f"Boundary collision time: {boundary_time*1000:.2f}ms")
-        
+
         # Conditional grid rebuilding
-        grid_start = time.perf_counter()
         if (self.current_frame - self.last_grid_rebuild) >= GRID_REBUILD_INTERVAL:
+            grid_start = time.perf_counter()
             self.rebuild_spatial_grid()
             self.last_grid_rebuild = self.current_frame
-        grid_time = time.perf_counter() - grid_start
-        print(f"Grid rebuild time: {grid_time*1000:.2f}ms")
-        
-        # Conditional mesh update
+            self.performance_stats['grid_rebuild_time'] = time.perf_counter() - grid_start
+
+        # Conditional mesh update (only needed in non-SSFR mode)
         if not use_ssfr:
-            mesh_start = time.perf_counter()
             mesh_vertices, mesh_triangles = [], []
             if (self.current_frame - self.last_mesh_update) >= MC_MESH_UPDATE_INTERVAL:
+                mesh_start = time.perf_counter()
                 mesh_vertices, mesh_triangles = self.update_mesh()
                 self.last_mesh_update = self.current_frame
-            mesh_time = time.perf_counter() - mesh_start
-            print(f"Mesh update time: {mesh_time*1000:.2f}ms")
-
-            # Total step time
-            total_time = time.perf_counter() - step_start
-            print(f"Total step time: {total_time*1000:.2f}ms")
-
+                self.performance_stats['mesh_generation_time'] = time.perf_counter() - mesh_start
             return mesh_vertices, mesh_triangles
         return [], []
     def rebuild_spatial_grid(self):
@@ -642,10 +628,6 @@ class MeshSystem:
             triangle_memory = triangles.nbytes / (1024 * 1024)  # MB
             self.performance_stats['memory_usage_mb'] = vertex_memory + triangle_memory
             
-            print(f"PySplashSurf mesh: {len(vertices)} verts, {len(triangles)} tris, {gen_time*1000:.1f}ms")
-            print(f"  - smoothing_length: {self.splashsurf_config['smoothing_length']:.3f}")
-            print(f"  - cube_size: {self.splashsurf_config['cube_size']:.3f}")
-            print(f"  - iso_threshold: {self.splashsurf_config['iso_surface_threshold']:.3f}")
             return vertices, triangles
             
         except Exception as e:
@@ -705,14 +687,14 @@ class OpenGLRenderer:
         self._vertex_data = None
         
         # ---- SSFR (Screen Space Fluid Rendering) ----
-        self.use_ssfr = False  # 默认使用网格渲染，可以通过UI切换到SSFR
+        self.use_ssfr = True  # 默认使用SSFR（性能更好）
 
-        # SSFR quality/perf knobs (甜蜜点)
+        # SSFR quality/perf knobs
         self.ssfr_scale = 0.5          # 0.5 = 半分辨率（强烈建议，性价比最高）
-        self.ssfr_particle_radius_world = 0.05  # 世界空间粒子半径(默认0.10，适合[-1,1]世界)
-        self.ssfr_blur_sigma = 1.5     # 模糊强度
-        self.ssfr_blur_radius = 7      # kernel半径（separable，性能还行）
-        self.ssfr_depth_sigma = 0.008  # 双边滤波深度sigma
+        self.ssfr_particle_radius_world = PARTICLE_RADIUS * 1.2  # 渲染半径略大于物理半径
+        self.ssfr_blur_sigma = 3.0     # 模糊强度（空间sigma，像素）
+        self.ssfr_blur_radius = 10     # kernel半径（separable）
+        self.ssfr_depth_sigma = 0.4    # 双边滤波深度sigma（世界空间单位）
 
         # runtime size cache
         self._ssfr_w = 0
@@ -849,7 +831,9 @@ class OpenGLRenderer:
         return True
     
     def _init_ssfr_resources(self):
-        # Fullscreen quad vertex shader
+        # ----------------------------------------------------------------
+        # Fullscreen quad vertex shader (shared by bilateral + composite)
+        # ----------------------------------------------------------------
         quad_vs = r'''
             #version 330
             in vec2 in_pos;
@@ -859,319 +843,343 @@ class OpenGLRenderer:
                 gl_Position = vec4(in_pos, 0.0, 1.0);
             }
         '''
-        
-        # --- Bilateral blur on depth (separable) ---
-        bilateral_fs = r'''
-            #version 330
-            uniform sampler2D u_depth;
-            uniform vec2 u_texel;     // 1/w, 1/h
-            uniform vec2 u_dir;       // (1,0) or (0,1)
-            uniform int u_radius;     // e.g. 7
-            uniform float u_sigma_xy; // spatial sigma in pixels (e.g. 2.5)
-            uniform float u_sigma_z;  // depth sigma (e.g. 0.01)
 
-            in vec2 v_uv;
-            out float frag_out;
-
-            float w_xy(float x, float sigma) {
-                return exp(-(x*x) / (2.0*sigma*sigma));
-            }
-
-            void main() {
-                float center = texture(u_depth, v_uv).r;
-
-                // background: we clear to 1.0
-                if (center >= 0.9999) {
-                    frag_out = 1.0;
-                    return;
-                }
-
-                float sum = 0.0;
-                float wsum = 0.0;
-
-                for (int i = -64; i <= 64; ++i) {
-                    if (i < -u_radius) continue;
-                    if (i >  u_radius) break;
-
-                    vec2 uv = v_uv + u_dir * u_texel * float(i);
-                    float d = texture(u_depth, uv).r;
-
-                    // ignore background samples to avoid pulling toward 1.0
-                    if (d >= 0.9999) continue;
-
-                    float wx = w_xy(float(i), u_sigma_xy);
-
-                    float dz = d - center;
-                    float wz = exp(-(dz*dz) / (2.0*u_sigma_z*u_sigma_z));
-
-                    float w = wx * wz;
-                    sum += d * w;
-                    wsum += w;
-                }
-
-                frag_out = (wsum > 1e-6) ? (sum / wsum) : center;
-            }
-        '''
-
-        # --- Particle VS: perspective-correct point size from world radius ---
+        # ----------------------------------------------------------------
+        # Particle VS: perspective-correct point size from world radius
+        # Outputs view-space center position for sphere impostor in FS
+        # ----------------------------------------------------------------
         particle_vs = r'''
         #version 330
-        
         uniform mat4 projection;
         uniform mat4 view;
-        
-        // particle radius in WORLD units (same units as positions)
         uniform float u_particle_radius_world;
-        
-        // viewport height in PIXELS of the current SSFR target (e.g. _ssfr_h)
         uniform float u_viewport_h;
-        
-        // extra tweak (1.0 = physically derived size)
         uniform float u_point_scale;
-        
         layout(location=0) in vec3 in_pos;
-        
-        // Pass view-space center position to fragment shader for sphere impostor
         out vec3 v_center_vs;
-        
         void main() {
             vec4 view_pos = view * vec4(in_pos, 1.0);
             v_center_vs = view_pos.xyz;
             gl_Position = projection * view_pos;
-        
-            // right-handed look-at: in front of camera => view_pos.z negative
             float z = max(-view_pos.z, 1e-4);
-        
-            // projection[1][1] = cot(fov_y/2)
             float proj_y = projection[1][1];
-        
-            // Pixel radius derived from perspective projection:
-            // r_px = (proj_y * r_world / z) * (viewport_h / 2)
             float r_px = (proj_y * u_particle_radius_world / z) * (u_viewport_h * 0.5);
-        
-            // gl_PointSize is DIAMETER in pixels
             gl_PointSize = clamp(2.0 * r_px * u_point_scale, 1.0, 2048.0);
         }
         '''
 
-        # --- Depth FS: output real depth (0..1) using gl_FragCoord.z, with sphere impostor correction ---
+        # ----------------------------------------------------------------
+        # Depth FS: stores LINEAR (view-space) depth as positive float.
+        # Background = 0.0, fluid = positive camera-distance value.
+        # Sphere impostor correction gives physically accurate depths.
+        # ----------------------------------------------------------------
         particle_depth_fs = r'''
         #version 330
-        
         uniform mat4 projection;
         uniform float u_particle_radius_world;
-        
         in vec3 v_center_vs;
-        
         out float out_depth;
-        
         void main() {
             vec2 p = gl_PointCoord * 2.0 - 1.0;
             float r2 = dot(p, p);
             if (r2 > 1.0) discard;
-        
-            float zcap = sqrt(max(1.0 - r2, 0.0)); // 0..1
-        
-            // In view space, camera looks down -Z, so points closer have larger (less negative) z.
-            // Sphere surface point along view direction:
-            vec3 surf_vs = v_center_vs + vec3(0.0, 0.0, u_particle_radius_world * zcap);
-        
-            vec4 clip = projection * vec4(surf_vs, 1.0);
-            float ndc_z = clip.z / clip.w;          // -1..1
-            float depth = ndc_z * 0.5 + 0.5;        // 0..1
-        
-            out_depth = clamp(depth, 0.0, 1.0);
+            float zcap = sqrt(1.0 - r2);
+            // Sphere surface in view space (z is negative for visible geometry)
+            float surf_z = v_center_vs.z + u_particle_radius_world * zcap;
+            // Linear depth = positive distance from camera
+            out_depth = max(-surf_z, 0.0);
+            // Update hardware depth buffer for proper particle-particle occlusion
+            vec4 clip = projection * vec4(v_center_vs.xy, surf_z, 1.0);
+            gl_FragDepth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
         }
         '''
 
-        # --- Thickness FS: linear additive thickness field (方案1) ---
+        # ----------------------------------------------------------------
+        # Thickness FS: additive per-particle contribution (chord length)
+        # ----------------------------------------------------------------
         particle_thick_fs = r'''
-            #version 330
-            out float out_thick;
-
-            void main() {
-                vec2 p = gl_PointCoord * 2.0 - 1.0;
-                float r2 = dot(p,p);
-                if (r2 > 1.0) discard;
-
-                float zcap = sqrt(1.0 - r2); // 0..1
-                // 方案1：输出线性可累加的厚度
-                out_thick = zcap * zcap;  // 线性厚度，可直接累加
-            }
+        #version 330
+        uniform float u_particle_radius_world;
+        out float out_thick;
+        void main() {
+            vec2 p = gl_PointCoord * 2.0 - 1.0;
+            float r2 = dot(p, p);
+            if (r2 > 1.0) discard;
+            // 2 * radius * cos(theta) gives chord length through sphere
+            out_thick = 2.0 * u_particle_radius_world * sqrt(1.0 - r2);
+        }
         '''
 
-        # --- Shadow depth pass: from light view ---
-        shadow_vs = r'''
-            #version 330
-            uniform mat4 u_light_proj;
-            uniform mat4 u_light_view;
-            uniform float u_particle_radius_world;
-            uniform float u_viewport_h;
-
-            layout(location=0) in vec3 in_pos;
-
-            void main() {
-                vec4 view_pos = u_light_view * vec4(in_pos, 1.0);
-                gl_Position = u_light_proj * view_pos;
-
-                float z = -view_pos.z;
-                z = max(z, 1e-3);
-
-                float proj_y = u_light_proj[1][1];
-                float point_size =
-                    (proj_y * u_particle_radius_world / z) * (u_viewport_h * 0.5) * 2.0;
-                gl_PointSize = clamp(point_size, 1.0, 1024.0);
+        # ----------------------------------------------------------------
+        # Bilateral depth blur (separable H+V passes)
+        # Works on LINEAR depth (positive floats, 0 = background)
+        # u_sigma_z is in world-space units for consistent smoothing
+        # ----------------------------------------------------------------
+        bilateral_fs = r'''
+        #version 330
+        uniform sampler2D u_depth;
+        uniform vec2 u_texel;
+        uniform vec2 u_dir;
+        uniform int u_radius;
+        uniform float u_sigma_xy;
+        uniform float u_sigma_z;
+        in vec2 v_uv;
+        out float frag_out;
+        void main() {
+            float center = texture(u_depth, v_uv).r;
+            if (center < 1e-4) { frag_out = 0.0; return; }
+            float sum = 0.0, wsum = 0.0;
+            for (int i = -64; i <= 64; ++i) {
+                if (i < -u_radius) continue;
+                if (i >  u_radius) break;
+                vec2 uv = v_uv + u_dir * u_texel * float(i);
+                float d = texture(u_depth, uv).r;
+                if (d < 1e-4) continue;
+                float wx = exp(-float(i * i) / (2.0 * u_sigma_xy * u_sigma_xy));
+                float dz = d - center;
+                float wz = exp(-(dz * dz) / (2.0 * u_sigma_z * u_sigma_z));
+                float w = wx * wz;
+                sum += d * w;
+                wsum += w;
             }
+            frag_out = (wsum > 1e-6) ? (sum / wsum) : center;
+        }
+        '''
+
+        # ----------------------------------------------------------------
+        # Shadow depth pass: from light's perspective
+        # ----------------------------------------------------------------
+        shadow_vs = r'''
+        #version 330
+        uniform mat4 u_light_proj;
+        uniform mat4 u_light_view;
+        uniform float u_particle_radius_world;
+        uniform float u_viewport_h;
+        layout(location=0) in vec3 in_pos;
+        out vec3 v_center_vs_light;
+        void main() {
+            vec4 view_pos = u_light_view * vec4(in_pos, 1.0);
+            v_center_vs_light = view_pos.xyz;
+            gl_Position = u_light_proj * view_pos;
+            float z = max(-view_pos.z, 1e-3);
+            float proj_y = u_light_proj[1][1];
+            float point_size = (proj_y * u_particle_radius_world / z) * (u_viewport_h * 0.5) * 2.0;
+            gl_PointSize = clamp(point_size, 1.0, 1024.0);
+        }
         '''
 
         shadow_fs = r'''
-            #version 330
-            out float out_depth;
-
-            void main() {
-                vec2 p = gl_PointCoord * 2.0 - 1.0;
-                float r2 = dot(p,p);
-                if (r2 > 1.0) discard;
-
-                // store light-space depth in 0..1
-                out_depth = gl_FragCoord.z;
-            }
+        #version 330
+        uniform mat4 u_light_proj;
+        uniform float u_particle_radius_world;
+        in vec3 v_center_vs_light;
+        out float out_depth;
+        void main() {
+            vec2 p = gl_PointCoord * 2.0 - 1.0;
+            float r2 = dot(p, p);
+            if (r2 > 1.0) discard;
+            float zcap = sqrt(1.0 - r2);
+            // Sphere impostor correction for shadow map too
+            float surf_z = v_center_vs_light.z + u_particle_radius_world * zcap;
+            vec4 clip = u_light_proj * vec4(v_center_vs_light.xy, surf_z, 1.0);
+            out_depth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
+            gl_FragDepth = out_depth;
+        }
         '''
 
-        # --- Composite FS: enhanced version with shadows/caustics/env mapping ---
+        # ----------------------------------------------------------------
+        # Composite FS — full photorealistic water shader
+        # Inspired by FluidSimulationDemo (xiaodoubao22):
+        #   • Reconstruct view-space position from linear depth
+        #   • Accurate normal from cross product of position gradients
+        #   • Schlick Fresnel (reflection / refraction mix)
+        #   • Beer-Lambert absorption (thickness buffer)
+        #   • Procedural sky environment (no cubemap asset needed)
+        #   • Shadow map sampling with bias
+        #   • Approximate caustics from thickness gradient
+        # ----------------------------------------------------------------
         comp_fs = r'''
-            #version 330
-            uniform sampler2D u_depth;   // blurred depth (camera)
-            uniform sampler2D u_thick;   // thickness
-            uniform sampler2D u_shadow;  // shadow map (light)
-            uniform vec2 u_texel;
+        #version 330
+        uniform sampler2D u_depth;      // linear depth (positive = camera distance)
+        uniform sampler2D u_thick;      // thickness buffer
+        uniform sampler2D u_shadow;     // shadow map (hardware depth 0-1)
+        uniform vec2 u_texel;           // 1/viewport_size for normal reconstruction
+        uniform vec2 u_shadow_texel;    // 1/shadow_map_size for PCF kernel
 
-            uniform mat4 u_light_vp;     // light_proj * light_view
+        // Camera: projection factors for position reconstruction
+        uniform float u_proj_x;         // projection[0][0] = f/aspect
+        uniform float u_proj_y;         // projection[1][1] = f
+        uniform mat4 u_view_inv;        // inverse view matrix: view-space -> world-space
 
-            uniform vec3 u_water_color;
-            uniform float u_alpha_base;
-            uniform float u_fresnel_power;
-            uniform float u_spec_power;
-            uniform float u_sigma_a;
-            uniform float u_sigma_s;
+        // Light
+        uniform mat4 u_light_vp;        // light projection * light view
+        uniform vec3 u_light_dir_ws;    // normalised light direction in world space
 
-            // caustics/shadow knobs
-            uniform float u_shadow_strength;  // 0..1 (how dark)
-            uniform float u_caustic_strength; // 0..something
-            uniform float u_caustic_power;    // 1..4
+        // Water material
+        uniform vec3  u_water_color;
+        uniform float u_alpha_base;
+        uniform float u_fresnel_power;
+        uniform float u_spec_power;
+        uniform float u_sigma_a;        // Beer-Lambert absorption coefficient
+        uniform float u_sigma_s;        // scattering coefficient
 
-            in vec2 v_uv;
-            out vec4 frag_color;
+        // Effect knobs
+        uniform float u_shadow_strength;
+        uniform float u_caustic_strength;
+        uniform float u_caustic_power;
 
-            vec3 normal_from_depth(vec2 uv) {
-                float dC = texture(u_depth, uv).r;
-                float dR = texture(u_depth, uv + vec2(u_texel.x, 0.0)).r;
-                float dU = texture(u_depth, uv + vec2(0.0, u_texel.y)).r;
+        in vec2 v_uv;
+        out vec4 frag_color;
 
-                if (dC >= 0.9999) return vec3(0.0, 0.0, 1.0);
+        // ------ Position reconstruction ----------------------------------
+        vec3 vs_pos(vec2 uv, float lin_d) {
+            vec2 ndc = uv * 2.0 - 1.0;
+            return vec3(ndc.x * lin_d / u_proj_x,
+                        ndc.y * lin_d / u_proj_y,
+                        -lin_d);  // view-space Z is negative for visible geometry
+        }
 
-                // 使用线性深度进行梯度计算，避免非线性depth的不稳定梯度
-                float dx = dR - dC;
-                float dy = dU - dC;
-                // 调整梯度缩放因子以适应线性深度
-                return normalize(vec3(-dx * 80.0, -dy * 80.0, 1.0));
+        // ------ Normal from cross product of position gradients ----------
+        // Reference: DrawFluidColor.frag (xiaodoubao22/FluidSimulationDemo)
+        vec3 vs_normal(vec2 uv, float dc) {
+            vec3 pc = vs_pos(uv, dc);
+
+            float dr = texture(u_depth, uv + vec2( u_texel.x, 0.0)).r;
+            float dl = texture(u_depth, uv - vec2( u_texel.x, 0.0)).r;
+            float du = texture(u_depth, uv + vec2( 0.0, u_texel.y)).r;
+            float dd = texture(u_depth, uv - vec2( 0.0, u_texel.y)).r;
+
+            // Pick the shorter gradient to avoid boundary discontinuities
+            vec3 dx, dy;
+            bool use_r = (dr > 1e-4) && (dl < 1e-4 || abs(dr - dc) <= abs(dl - dc));
+            bool use_u = (du > 1e-4) && (dd < 1e-4 || abs(du - dc) <= abs(dd - dc));
+
+            if (use_r)        dx = vs_pos(uv + vec2( u_texel.x, 0.0), dr) - pc;
+            else if (dl > 1e-4) dx = pc - vs_pos(uv - vec2( u_texel.x, 0.0), dl);
+            else return vec3(0.0, 0.0, 1.0);
+
+            if (use_u)        dy = vs_pos(uv + vec2(0.0,  u_texel.y), du) - pc;
+            else if (dd > 1e-4) dy = pc - vs_pos(uv - vec2(0.0,  u_texel.y), dd);
+            else return vec3(0.0, 0.0, 1.0);
+
+            if (length(dx) < 1e-8 || length(dy) < 1e-8)
+                return vec3(0.0, 0.0, 1.0);
+
+            return normalize(cross(dx, dy));
+        }
+
+        // ------ Procedural sky (replaces cubemap) ------------------------
+        vec3 sky(vec3 dir) {
+            float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+            vec3 zenith  = vec3(0.10, 0.30, 0.80);
+            vec3 horizon = vec3(0.70, 0.85, 1.00);
+            vec3 ground  = vec3(0.08, 0.08, 0.10);
+            vec3 col = (dir.y >= 0.0)
+                ? mix(horizon, zenith,  pow(t, 0.6))
+                : mix(horizon, ground, pow(1.0 - t, 1.5));
+            // Sun disc
+            vec3 sun_dir = normalize(u_light_dir_ws);
+            float sun = pow(max(dot(dir, sun_dir), 0.0), 256.0);
+            col += vec3(1.0, 0.95, 0.80) * sun * 2.0;
+            return col;
+        }
+
+        // ------ Shadow sampling ------------------------------------------
+        float sample_shadow(vec3 pos_ws) {
+            vec4 lp = u_light_vp * vec4(pos_ws, 1.0);
+            vec3 ndc = lp.xyz / lp.w;
+            vec2 suv = ndc.xy * 0.5 + 0.5;
+            if (suv.x < 0.01 || suv.x > 0.99 || suv.y < 0.01 || suv.y > 0.99)
+                return 1.0;
+            float cur = ndc.z * 0.5 + 0.5;
+            // 3x3 PCF kernel — u_shadow_texel keeps this in sync with shadow map size
+            float shadow = 0.0;
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    float s = texture(u_shadow, suv + vec2(dx, dy) * u_shadow_texel).r;
+                    shadow += (s + 0.003 < cur) ? (1.0 - u_shadow_strength) : 1.0;
+                }
             }
+            return shadow / 9.0;
+        }
 
-            // cheap procedural environment (no cubemap asset required)
-            vec3 env_color(vec3 dir) {
-                float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-                vec3 sky = vec3(0.55, 0.70, 0.95);
-                vec3 ground = vec3(0.10, 0.10, 0.12);
-                return mix(ground, sky, t);
-            }
+        void main() {
+            float lin_d = texture(u_depth, v_uv).r;
+            if (lin_d < 1e-4) discard;
 
-            float sample_shadow(vec3 world_pos) {
-                vec4 lp = u_light_vp * vec4(world_pos, 1.0);
-                vec3 ndc = lp.xyz / lp.w;
-                vec2 suv = ndc.xy * 0.5 + 0.5;
-                float cur = ndc.z * 0.5 + 0.5; // to 0..1
+            // Reconstruct view-space position and normal
+            vec3 pos_vs = vs_pos(v_uv, lin_d);
+            vec3 N_vs   = vs_normal(v_uv, lin_d);
 
-                // outside shadow map => lit
-                if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) return 1.0;
+            // Transform to world space
+            vec3 pos_ws = (u_view_inv * vec4(pos_vs, 1.0)).xyz;
+            vec3 N_ws   = normalize(mat3(u_view_inv) * N_vs);
+            vec3 cam_ws = (u_view_inv * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+            vec3 V      = normalize(cam_ws - pos_ws);
 
-                float sd = texture(u_shadow, suv).r;
+            float NdotV = max(dot(N_ws, V), 0.0);
 
-                // bias reduces acne; tune with particle radius / scale
-                float bias = 0.0025;
-                float lit = (sd + bias < cur) ? (1.0 - u_shadow_strength) : 1.0;
-                return lit;
-            }
+            // Schlick Fresnel — water F0 ≈ 0.02
+            float F0 = 0.02;
+            float fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, u_fresnel_power);
 
-            void main() {
-                float d = texture(u_depth, v_uv).r;
-                if (d >= 0.9999) discard;
+            // Thickness & Beer-Lambert absorption
+            float thick = clamp(texture(u_thick, v_uv).r, 0.0, 10.0);
+            float trans  = exp(-u_sigma_a * thick);
+            float scatter = (1.0 - trans) * u_sigma_s;
 
-                float thick_raw = texture(u_thick, v_uv).r;
-                // 方案1：thickness pass已输出线性厚度，composite只做一次映射
-                float thick = clamp(thick_raw * 2.5, 0.0, 1.0);  // 线性映射到[0,1]
+            // Lighting
+            vec3  L = normalize(u_light_dir_ws);
+            vec3  H = normalize(L + V);
+            float NdotL = max(dot(N_ws, L), 0.0);
+            float spec  = pow(max(dot(N_ws, H), 0.0), u_spec_power);
 
-                // 暂时禁用阴影采样以定位问题（按建议）
-                vec3 world_pos = vec3((v_uv - 0.5) * 6.0, (1.0 - d) * 6.0);
-                
-                vec3 N = normal_from_depth(v_uv);
-                vec3 V = vec3(0.0, 0.0, 1.0);
-                vec3 L = normalize(vec3(0.35, 0.85, 0.25));
-                vec3 H = normalize(L + V);
-                
-                float NdotL = max(dot(N, L), 0.0);
-                float NdotV = max(dot(N, V), 0.0);
-                
-                float F0 = 0.02;
-                float fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, u_fresnel_power);
-                float spec = pow(max(dot(N, H), 0.0), u_spec_power);
-                
-                // Beer-Lambert
-                float trans = exp(-u_sigma_a * thick);
-                float scatter = (1.0 - trans) * u_sigma_s;
-                
-                vec3 base = u_water_color * (0.25 + 0.75 * NdotL) * (0.35 + 0.65 * (1.0 - trans) + scatter);
-                
-                // Caustics approx: thickness gradient -> brighten
-                float tC = thick;
-                float tR = texture(u_thick, v_uv + vec2(u_texel.x, 0.0)).r;
-                float tU = texture(u_thick, v_uv + vec2(0.0, u_texel.y)).r;
-                float grad = length(vec2(tR - tC, tU - tC));
-                float caustic = pow(grad * 12.0, u_caustic_power) * u_caustic_strength;
-                
-                // Env reflection/refraction approx
-                vec3 R = reflect(-V, N);
-                vec3 refr = refract(-V, N, 1.0 / 1.33);
-                vec3 envR = env_color(R);
-                vec3 envT = env_color(refr);
-                
-                vec3 color = base;
-                color += envR * (0.12 + 0.35 * fresnel);
-                color = mix(color, envT, 0.08 * (1.0 - fresnel));
-                color += vec3(1.0) * spec * (0.35 + 0.65 * fresnel);
-                
-                // 暂时禁用阴影和焦散以改善水体基础外观
-                float shadow = sample_shadow(world_pos);
-                color *= shadow;
-                // float shadow = 1.0;  // 临时设为无阴影
-                
-                // Add caustics after shadow (looks like light focusing on lit regions)
-                color += caustic * vec3(1.0, 0.98, 0.90) * shadow;
+            // Shadow
+            float shad = sample_shadow(pos_ws);
 
-                float alpha = u_alpha_base + (1.0 - trans) * 0.90 + fresnel * 0.20;
-                alpha = clamp(alpha, 0.03, 0.98);
+            // Fluid body color (absorption + scatter + diffuse)
+            vec3 fluid_body = u_water_color * ((1.0 - trans) * 0.5 + scatter);
+            fluid_body += u_water_color * 0.35 * NdotL * shad;
 
-                frag_color = vec4(color, alpha);
-            }
+            // Environment reflection & refraction (procedural sky)
+            vec3 refl_dir = reflect(-V, N_ws);
+            vec3 refr_dir = refract(-V, N_ws, 1.0 / 1.333);
+            vec3 env_refl = sky(refl_dir);
+            vec3 env_refr = (length(refr_dir) > 0.5) ? sky(refr_dir) : sky(-V);
+
+            // Blend refracted environment with fluid body by depth
+            float fluid_opacity = clamp((1.0 - trans) * 2.0 + scatter, 0.0, 1.0);
+            vec3 refr_color = mix(env_refr, fluid_body, fluid_opacity);
+
+            // Final mix: refraction + Fresnel reflection
+            vec3 color = mix(refr_color, env_refl, fresnel);
+
+            // Specular highlight on top
+            color += vec3(1.0) * spec * (0.3 + 0.7 * fresnel) * shad;
+
+            // Caustics: brightness spikes at thickness gradient edges
+            float tC = texture(u_thick, v_uv).r;
+            float tR = texture(u_thick, v_uv + vec2( u_texel.x, 0.0)).r;
+            float tU = texture(u_thick, v_uv + vec2( 0.0, u_texel.y)).r;
+            float cgrad   = length(vec2(tR - tC, tU - tC));
+            float caustic = pow(clamp(cgrad * 8.0, 0.0, 1.0), u_caustic_power) * u_caustic_strength;
+            color += caustic * vec3(1.0, 0.96, 0.82) * shad;
+
+            // Alpha driven by thickness + Fresnel
+            float alpha = clamp(u_alpha_base + (1.0 - trans) * 0.85 + fresnel * 0.25, 0.05, 0.98);
+
+            frag_color = vec4(color, alpha);
+        }
         '''
 
-        # compile programs
+        # Compile programs
         self.particle_depth_prog = self.ctx.program(vertex_shader=particle_vs, fragment_shader=particle_depth_fs)
         self.particle_thick_prog = self.ctx.program(vertex_shader=particle_vs, fragment_shader=particle_thick_fs)
         self.bilateral_prog = self.ctx.program(vertex_shader=quad_vs, fragment_shader=bilateral_fs)
         self.composite_prog = self.ctx.program(vertex_shader=quad_vs, fragment_shader=comp_fs)
         self.shadow_prog = self.ctx.program(vertex_shader=shadow_vs, fragment_shader=shadow_fs)
 
-        # fullscreen quad
+        # Fullscreen quad
         quad = np.array([
             -1.0, -1.0,
              1.0, -1.0,
@@ -1185,7 +1193,7 @@ class OpenGLRenderer:
         self.quad_vao_bilateral = self.ctx.vertex_array(self.bilateral_prog, [(self.quad_vbo, '2f', 'in_pos')])
         self.quad_vao_comp = self.ctx.vertex_array(self.composite_prog, [(self.quad_vbo, '2f', 'in_pos')])
 
-        # particle vbo/vao (reuse one vbo, create two vaos for two programs)
+        # Particle VBO / VAOs (one VBO shared across passes for zero-copy)
         self.particle_vbo = self.ctx.buffer(reserve=MAX_PARTICLES * 3 * 4)
         self.particle_vao_depth = self.ctx.vertex_array(self.particle_depth_prog, [(self.particle_vbo, '3f', 'in_pos')])
         self.particle_vao_thick = self.ctx.vertex_array(self.particle_thick_prog, [(self.particle_vbo, '3f', 'in_pos')])
@@ -1265,7 +1273,7 @@ class OpenGLRenderer:
 
         self._ssfr_w, self._ssfr_h = w, h
 
-        # release old
+        # Release old resources
         for obj in (
             getattr(self, "depth_fbo0", None),
             getattr(self, "depth_fbo1", None),
@@ -1273,6 +1281,8 @@ class OpenGLRenderer:
             getattr(self, "depth_tex0", None),
             getattr(self, "depth_tex1", None),
             getattr(self, "thick_tex", None),
+            getattr(self, "_depth_rb0", None),
+            getattr(self, "_depth_rb1", None),
         ):
             try:
                 if obj is not None:
@@ -1280,45 +1290,53 @@ class OpenGLRenderer:
             except Exception:
                 pass
 
-        # Create new SSFR textures and FBOs
-        # depth: R32F for precision (bilateral uses dz)
+        # Linear depth color textures (R32F): background=0, fluid=positive distance
         self.depth_tex0 = self.ctx.texture((w, h), components=1, dtype='f4')
         self.depth_tex1 = self.ctx.texture((w, h), components=1, dtype='f4')
         for t in (self.depth_tex0, self.depth_tex1):
             t.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
-        # thickness: R16F is fine
+        # Depth renderbuffers: enable hardware depth-test for sphere impostor z-fighting
+        self._depth_rb0 = self.ctx.depth_renderbuffer((w, h))
+        self._depth_rb1 = self.ctx.depth_renderbuffer((w, h))
+
+        # Thickness texture (R16F: sufficient for additive thickness, saves VRAM)
         self.thick_tex = self.ctx.texture((w, h), components=1, dtype='f2')
         self.thick_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
-        self.depth_fbo0 = self.ctx.framebuffer(color_attachments=[self.depth_tex0])
-        self.depth_fbo1 = self.ctx.framebuffer(color_attachments=[self.depth_tex1])
+        # FBOs: depth passes get hardware depth buffer for proper occlusion
+        self.depth_fbo0 = self.ctx.framebuffer(
+            color_attachments=[self.depth_tex0], depth_attachment=self._depth_rb0)
+        self.depth_fbo1 = self.ctx.framebuffer(
+            color_attachments=[self.depth_tex1], depth_attachment=self._depth_rb1)
+        # Thickness pass: no depth test (additive blending)
         self.thick_fbo = self.ctx.framebuffer(color_attachments=[self.thick_tex])
 
     def _ensure_shadow_targets(self, width: int, height: int):
-        w = max(1, int(width * self.ssfr_scale * self.shadow_scale))
-        h = max(1, int(height * self.ssfr_scale * self.shadow_scale))
+        # Fixed shadow map resolution defined by SHADOW_MAP_SIZE constant
+        w = SHADOW_MAP_SIZE
+        h = SHADOW_MAP_SIZE
         if w == self.shadow_w and h == self.shadow_h and self.shadow_fbo is not None:
             return
 
         self.shadow_w, self.shadow_h = w, h
 
-        # release old shadow resources
-        for obj in (self.shadow_fbo, self.shadow_tex):
+        # Release old shadow resources
+        for obj in (self.shadow_fbo, self.shadow_tex, getattr(self, "_shadow_depth_rb", None)):
             try:
                 if obj is not None:
                     obj.release()
             except Exception:
                 pass
 
-        # Create shadow map resources
         self.shadow_tex = self.ctx.texture((w, h), components=1, dtype='f4')
         self.shadow_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        # 采样超出边界时，避免引入错误阴影
         self.shadow_tex.repeat_x = False
         self.shadow_tex.repeat_y = False
 
-        self.shadow_fbo = self.ctx.framebuffer(color_attachments=[self.shadow_tex])
+        self._shadow_depth_rb = self.ctx.depth_renderbuffer((w, h))
+        self.shadow_fbo = self.ctx.framebuffer(
+            color_attachments=[self.shadow_tex], depth_attachment=self._shadow_depth_rb)
 
     def update_particles(self, positions: np.ndarray):
         """positions: shape (N,3) float32"""
@@ -1499,137 +1517,155 @@ class OpenGLRenderer:
     
     def _render_ssfr(self, width: int, height: int, screen_fbo):
         self._ensure_ssfr_targets(width, height)
+        self._ensure_shadow_targets(width, height)
 
-        projection = self._perspective(60.0, width / height, 0.1, 100.0)
-        cam_pos = self._calculate_camera_position()
-        view = self._look_at(cam_pos, self.camera_target, [0.0, 1.0, 0.0])
+        near, far = 0.1, 100.0
+        projection = self._perspective(60.0, width / height, near, far)
+        cam_pos    = self._calculate_camera_position()
+        view       = self._look_at(cam_pos, self.camera_target, [0.0, 1.0, 0.0])
+        # Inverse view for world-space reconstruction in composite pass
+        view_inv   = np.linalg.inv(view).astype(np.float32)
 
-        # SSFR passes 需要深度测试（点精灵互相遮挡正确）
+        r_world = float(self.ssfr_particle_radius_world)
+
+        # ----------------------------------------------------------------
+        # Pass 1 – Depth (sphere impostor → linear depth in R32F color tex)
+        # Hardware depth test enabled so closer spheres overwrite far ones
+        # ----------------------------------------------------------------
         self.ctx.enable(moderngl.DEPTH_TEST)
-
-        # ----------------------------
-        # 1) Depth pass (no blending)
-        # ----------------------------
-        self.depth_fbo0.use()
-        self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
-        # clear to 1.0 -> background far
-        self.ctx.clear(1.0, 1.0, 1.0, 1.0)
         self.ctx.disable(moderngl.BLEND)
 
-        if self.particle_count > 0:
-            prog = self.particle_depth_prog
-            prog['projection'].write(projection.astype('f4').tobytes())
-            prog['view'].write(view.astype('f4').tobytes())
-            prog['u_particle_radius_world'].value = float(self.ssfr_particle_radius_world)
-            prog['u_viewport_h'].value = float(self._ssfr_h)
-            prog['u_point_scale'].value = 1.0  # 物理正确的点大小缩放
-            self.particle_vao_depth.render(mode=moderngl.POINTS, vertices=self.particle_count)
-
-        # ------------------------------------
-        # 2) Bilateral blur depth (H then V)
-        # ------------------------------------
-        self.bilateral_prog['u_texel'].value = (1.0 / self._ssfr_w, 1.0 / self._ssfr_h)
-        self.bilateral_prog['u_radius'].value = int(self.ssfr_blur_radius)
-        self.bilateral_prog['u_sigma_xy'].value = float(max(1.5, self.ssfr_blur_sigma))
-        # Depth sigma: important knob. Bigger = more blur across depth changes (worse edges)
-        self.bilateral_prog['u_sigma_z'].value = self.ssfr_depth_sigma
-
-        # H: depth0 -> depth1
-        self.depth_fbo1.use()
-        self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
-        self.ctx.clear(1.0, 1.0, 1.0, 1.0)
-        self.bilateral_prog['u_dir'].value = (1.0, 0.0)
-        self.depth_tex0.use(location=0)
-        self.bilateral_prog['u_depth'].value = 0
-        self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
-
-        # V: depth1 -> depth0
         self.depth_fbo0.use()
         self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
-        self.ctx.clear(1.0, 1.0, 1.0, 1.0)
-        self.bilateral_prog['u_dir'].value = (0.0, 1.0)
-        self.depth_tex1.use(location=0)
-        self.bilateral_prog['u_depth'].value = 0
+        self.ctx.clear(0.0, 0.0, 0.0, 0.0)   # clear color=0 (background), depth=1 (far)
+
+        if self.particle_count > 0:
+            p = self.particle_depth_prog
+            p['projection'].write(projection.tobytes())
+            p['view'].write(view.tobytes())
+            p['u_particle_radius_world'].value = r_world
+            p['u_viewport_h'].value = float(self._ssfr_h)
+            p['u_point_scale'].value = 1.0
+            self.particle_vao_depth.render(mode=moderngl.POINTS, vertices=self.particle_count)
+
+        # ----------------------------------------------------------------
+        # Pass 2 – Bilateral depth blur  (separable H then V)
+        # Sigma values: sigma_xy in pixels, sigma_z in world-space units
+        # ----------------------------------------------------------------
+        self.ctx.disable(moderngl.DEPTH_TEST)
+
+        bp = self.bilateral_prog
+        bp['u_texel'].value = (1.0 / self._ssfr_w, 1.0 / self._ssfr_h)
+        bp['u_radius'].value = int(self.ssfr_blur_radius)
+        bp['u_sigma_xy'].value = float(max(1.0, self.ssfr_blur_sigma))
+        bp['u_sigma_z'].value  = float(self.ssfr_depth_sigma)   # world-space units
+
+        # H pass: depth0 → depth1
+        self.depth_fbo1.use()
+        self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
+        self.ctx.clear(0.0, 0.0, 0.0, 0.0)
+        bp['u_dir'].value = (1.0, 0.0)
+        self.depth_tex0.use(location=0)
+        bp['u_depth'].value = 0
         self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
 
-        # ------------------------------------
-        # 3) Thickness pass (additive blending)
-        # ------------------------------------
+        # V pass: depth1 → depth0  (result lives in depth_tex0)
+        self.depth_fbo0.use()
+        self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
+        self.ctx.clear(0.0, 0.0, 0.0, 0.0)
+        bp['u_dir'].value = (0.0, 1.0)
+        self.depth_tex1.use(location=0)
+        bp['u_depth'].value = 0
+        self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
+
+        # ----------------------------------------------------------------
+        # Pass 3 – Thickness  (additive blending, no depth test)
+        # ----------------------------------------------------------------
         self.thick_fbo.use()
         self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
         self.ctx.clear(0.0, 0.0, 0.0, 0.0)
-
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = (moderngl.ONE, moderngl.ONE)
 
         if self.particle_count > 0:
-            prog = self.particle_thick_prog
-            prog['projection'].write(projection.astype('f4').tobytes())
-            prog['view'].write(view.astype('f4').tobytes())
-            prog['u_particle_radius_world'].value = float(self.ssfr_particle_radius_world)
-            prog['u_viewport_h'].value = float(self._ssfr_h)
-            prog['u_point_scale'].value = 1.0  # 物理正确的点大小缩放
+            p = self.particle_thick_prog
+            p['projection'].write(projection.tobytes())
+            p['view'].write(view.tobytes())
+            p['u_particle_radius_world'].value = r_world
+            p['u_viewport_h'].value = float(self._ssfr_h)
+            p['u_point_scale'].value = 1.0
             self.particle_vao_thick.render(mode=moderngl.POINTS, vertices=self.particle_count)
 
-        # restore blending for composite
         self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
-        # ----------------------------
-        # 4) Shadow map pass (light view)
-        # ----------------------------
-        self._ensure_shadow_targets(width, height)
+        # ----------------------------------------------------------------
+        # Pass 4 – Shadow map  (from light's perspective)
+        # ----------------------------------------------------------------
+        self.ctx.disable(moderngl.BLEND)
+        self.ctx.enable(moderngl.DEPTH_TEST)
+
+        light_proj = self._perspective(70.0, 1.0, 0.5, 60.0)
+        light_view = self._look_at(self.light_pos.tolist(), self.light_target.tolist(), [0.0, 1.0, 0.0])
+        light_vp   = (light_proj @ light_view).astype(np.float32)
+        # World-space light direction (from light toward scene centre)
+        light_dir_ws = (self.light_target - self.light_pos)
+        light_dir_ws = light_dir_ws / (np.linalg.norm(light_dir_ws) + 1e-8)
+
         self.shadow_fbo.use()
         self.ctx.viewport = (0, 0, self.shadow_w, self.shadow_h)
-        self.ctx.clear(1.0, 1.0, 1.0, 1.0)
-        self.ctx.disable(moderngl.BLEND)
-
-        # light matrices (simple spot-like)
-        light_proj = self._perspective(70.0, self.shadow_w / self.shadow_h, 0.1, 50.0)
-        light_view = self._look_at(self.light_pos.tolist(), self.light_target.tolist(), [0.0, 1.0, 0.0])
+        self.ctx.clear(1.0, 1.0, 1.0, 1.0)   # shadow map: 1.0 = nothing blocking
 
         if self.particle_count > 0:
-            prog = self.shadow_prog
-            prog['u_light_proj'].write(light_proj.astype('f4').tobytes())
-            prog['u_light_view'].write(light_view.astype('f4').tobytes())
-            prog['u_particle_radius_world'].value = float(self.ssfr_particle_radius_world)
-            prog['u_viewport_h'].value = float(self.shadow_h)
+            p = self.shadow_prog
+            p['u_light_proj'].write(light_proj.tobytes())
+            p['u_light_view'].write(light_view.tobytes())
+            p['u_particle_radius_world'].value = r_world
+            p['u_viewport_h'].value = float(self.shadow_h)
             self.shadow_vao.render(mode=moderngl.POINTS, vertices=self.particle_count)
 
-        # ----------------------------
-        # 5) Composite to screen
-        # ----------------------------
+        # ----------------------------------------------------------------
+        # Pass 5 – Composite  (depth + thick + shadow → final water color)
+        # ----------------------------------------------------------------
         screen_fbo.use()
         self.ctx.viewport = (0, 0, width, height)
+        self.ctx.disable(moderngl.DEPTH_TEST)
         self.ctx.enable(moderngl.BLEND)
-        self.ctx.clear(0.10, 0.12, 0.16, 1.0)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self.ctx.clear(0.06, 0.08, 0.12, 1.0)   # dark blue-grey background
 
-        self.composite_prog['u_texel'].value = (1.0 / self._ssfr_w, 1.0 / self._ssfr_h)
+        cp = self.composite_prog
 
-        # 暂时注释掉light_vp设置，因为暂时禁用了阴影
-        # light vp for shadow sampling
-        # light_vp = (light_proj @ light_view).astype(np.float32)
-        # self.composite_prog['u_light_vp'].write(light_vp.tobytes())
+        # Camera reconstruction uniforms
+        cp['u_texel'].value    = (1.0 / self._ssfr_w, 1.0 / self._ssfr_h)
+        cp['u_proj_x'].value   = float(projection[0, 0])
+        cp['u_proj_y'].value   = float(projection[1, 1])
+        cp['u_view_inv'].write(view_inv.tobytes())
 
-        # 按建议调整的水体渲染参数
-        self.composite_prog['u_water_color'].value = (0.08, 0.35, 0.65)  # 更深的水色
-        self.composite_prog['u_alpha_base'].value = 0.03  # 稍微提高基础透明度
-        self.composite_prog['u_fresnel_power'].value = 5.0
-        self.composite_prog['u_spec_power'].value = 128.0  # 提高高光锐度
-        self.composite_prog['u_sigma_a'].value = 5.0  # 提高吸收系数(3~8)
-        self.composite_prog['u_sigma_s'].value = 0.15  # 降低散射系数(0.05~0.2)
+        # Light uniforms
+        cp['u_light_vp'].write(light_vp.tobytes())
+        cp['u_light_dir_ws'].value  = tuple(light_dir_ws.astype(np.float32).tolist())
+        cp['u_shadow_texel'].value  = (1.0 / self.shadow_w, 1.0 / self.shadow_h)
 
-        # 暂时禁用阴影和焦散相关的uniform设置，因为可能存在编译问题
-        self.composite_prog['u_shadow_strength'].value = 0.0  # 禁用阴影
-        self.composite_prog['u_caustic_strength'].value = 0.0  # 禁用焦散
-        self.composite_prog['u_caustic_power'].value = 2.0
+        # Water material
+        cp['u_water_color'].value    = (0.04, 0.28, 0.60)   # deep water blue
+        cp['u_alpha_base'].value     = 0.05
+        cp['u_fresnel_power'].value  = 5.0
+        cp['u_spec_power'].value     = 200.0
+        cp['u_sigma_a'].value        = 4.0    # absorption (thicker = darker)
+        cp['u_sigma_s'].value        = 0.20   # subsurface scatter tint
 
+        # Effect knobs
+        cp['u_shadow_strength'].value  = 0.55
+        cp['u_caustic_strength'].value = 1.8
+        cp['u_caustic_power'].value    = 2.5
+
+        # Bind textures
         self.depth_tex0.use(location=0)
         self.thick_tex.use(location=1)
         self.shadow_tex.use(location=2)
-
-        self.composite_prog['u_depth'].value = 0
-        self.composite_prog['u_thick'].value = 1
-        # self.composite_prog['u_shadow'].value = 2  # 暂时禁用，因为u_shadow sampler被注释掉了
+        cp['u_depth'].value  = 0
+        cp['u_thick'].value  = 1
+        cp['u_shadow'].value = 2
 
         self.quad_vao_comp.render(moderngl.TRIANGLES, vertices=6)
 
@@ -1892,7 +1928,7 @@ class MainWindow(QMainWindow):
         
         # Rendering mode toggle
         self.render_mode_toggle = QCheckBox("使用SSFR渲染(直接粒子渲染)")
-        self.render_mode_toggle.setChecked(False)
+        self.render_mode_toggle.setChecked(True)
         self.render_mode_toggle.stateChanged.connect(self.toggle_render_mode)
         layout.addWidget(self.render_mode_toggle)
         
@@ -1940,35 +1976,36 @@ class MainWindow(QMainWindow):
         # SSFR 参数调节
         ssfr_group = QGroupBox("SSFR参数调节")
         ssfr_layout = QVBoxLayout()
-        
+
         # 世界空间粒子半径
         ssfr_layout.addWidget(QLabel("粒子世界半径:"))
         self.ssfr_radius_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ssfr_radius_slider.setRange(5, 100)  # 0.05 to 1.00 (更适合[-1,1]世界)
-        self.ssfr_radius_slider.setValue(10)  # 0.10 default
+        self.ssfr_radius_slider.setRange(5, 100)  # 0.05 to 1.00
+        radius_slider_init = int(PARTICLE_RADIUS * 1.2 * 100)
+        self.ssfr_radius_slider.setValue(radius_slider_init)
         self.ssfr_radius_slider.valueChanged.connect(self.update_ssfr_params)
         ssfr_layout.addWidget(self.ssfr_radius_slider)
-        self.ssfr_radius_label = QLabel("0.10")
+        self.ssfr_radius_label = QLabel(f"{PARTICLE_RADIUS * 1.2:.2f}")
         ssfr_layout.addWidget(self.ssfr_radius_label)
-        
-        # 模糊强度
+
+        # 模糊强度（空间sigma，像素）
         ssfr_layout.addWidget(QLabel("模糊强度:"))
         self.ssfr_sigma_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ssfr_sigma_slider.setRange(5, 50)  # 0.5 to 5.0
-        self.ssfr_sigma_slider.setValue(15)  # 1.5 default
+        self.ssfr_sigma_slider.setRange(5, 80)  # 0.5 to 8.0
+        self.ssfr_sigma_slider.setValue(30)      # 3.0 default
         self.ssfr_sigma_slider.valueChanged.connect(self.update_ssfr_params)
         ssfr_layout.addWidget(self.ssfr_sigma_slider)
-        self.ssfr_sigma_label = QLabel("1.5")
+        self.ssfr_sigma_label = QLabel("3.0")
         ssfr_layout.addWidget(self.ssfr_sigma_label)
-        
-        # 双边滤波深度sigma
-        ssfr_layout.addWidget(QLabel("深度sigma:"))
+
+        # 双边滤波深度sigma（世界空间单位）
+        ssfr_layout.addWidget(QLabel("深度sigma(世界单位):"))
         self.ssfr_depth_sigma_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ssfr_depth_sigma_slider.setRange(1, 50)  # 0.001 to 0.05
-        self.ssfr_depth_sigma_slider.setValue(8)  # 0.008 default
+        self.ssfr_depth_sigma_slider.setRange(1, 100)  # 0.1 to 10.0
+        self.ssfr_depth_sigma_slider.setValue(4)        # 0.4 default
         self.ssfr_depth_sigma_slider.valueChanged.connect(self.update_ssfr_params)
         ssfr_layout.addWidget(self.ssfr_depth_sigma_slider)
-        self.ssfr_depth_sigma_label = QLabel("0.008")
+        self.ssfr_depth_sigma_label = QLabel("0.4")
         ssfr_layout.addWidget(self.ssfr_depth_sigma_label)
         
         # 吸收系数
@@ -2126,34 +2163,29 @@ class MainWindow(QMainWindow):
     
     def update_ssfr_params(self):
         """Update SSFR rendering parameters"""
-        # 更新世界空间粒子半径
         radius = self.ssfr_radius_slider.value() / 100.0
         self.opengl_renderer.ssfr_particle_radius_world = radius
-        self.ssfr_radius_label.setText(f"{radius:.3f}")
-        
-        # 更新模糊强度
+        self.ssfr_radius_label.setText(f"{radius:.2f}")
+
         sigma = self.ssfr_sigma_slider.value() / 10.0
         self.opengl_renderer.ssfr_blur_sigma = sigma
         self.ssfr_sigma_label.setText(f"{sigma:.1f}")
-        
-        # 更新双边滤波深度sigma
-        depth_sigma = self.ssfr_depth_sigma_slider.value() / 1000.0
+
+        # Depth sigma now in world-space units (slider / 10.0 gives 0.1–10.0)
+        depth_sigma = self.ssfr_depth_sigma_slider.value() / 10.0
         self.opengl_renderer.ssfr_depth_sigma = depth_sigma
-        self.ssfr_depth_sigma_label.setText(f"{depth_sigma:.3f}")
-        
-        # 更新吸收系数
+        self.ssfr_depth_sigma_label.setText(f"{depth_sigma:.2f}")
+
         absorption = self.ssfr_absorption_slider.value() / 10.0
         if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_sigma_a' in self.opengl_renderer.composite_prog.uniforms:
             self.opengl_renderer.composite_prog['u_sigma_a'].value = absorption
         self.ssfr_absorption_label.setText(f"{absorption:.1f}")
-        
-        # 更新散射系数
+
         scatter = self.ssfr_scatter_slider.value() / 10.0
         if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_sigma_s' in self.opengl_renderer.composite_prog.uniforms:
             self.opengl_renderer.composite_prog['u_sigma_s'].value = scatter
         self.ssfr_scatter_label.setText(f"{scatter:.2f}")
-        
-        # 实时刷新渲染
+
         self.opengl_widget.update()
     
     def update_simulation(self):
