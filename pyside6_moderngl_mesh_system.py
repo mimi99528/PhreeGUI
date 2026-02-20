@@ -80,8 +80,9 @@ def profile_function(func):
 # System parameters
 MC_GRID_RES = 16
 
-# 放大粒子半径解决"星星太小"问题
-PARTICLE_RADIUS = 0.3
+# 粒子半径：需与 PySPlisHSPlasH 一致，0.05 可在 2×2.9×2 流体块中
+# 产生 ~11 600 个粒子，兼顾密度与性能
+PARTICLE_RADIUS = 0.05
 
 MAX_PARTICLES = 15000
 H = PARTICLE_RADIUS * 2.0
@@ -179,7 +180,7 @@ class MeshSystem:
                 'smoothing_length': 2.5 * PARTICLE_RADIUS,
                 # cube_size 设为 ~ particle_radius * (1.0~2.0) 的量级
                 'cube_size': PARTICLE_RADIUS * 1.5,
-                'iso_surface_threshold': 0.05,
+                'iso_surface_threshold': 0.6,
                 'enable_multithreading': True,
                 'enable_simd': True
             }
@@ -212,6 +213,10 @@ class MeshSystem:
             
             # 第5步：添加边界到场景（使用官方Scenes模块构造）
             self._setup_boundary_with_scenes_module()
+            
+            # 第5.5步：显式设置粒子半径（与 PARTICLE_RADIUS 保持一致）
+            self.scene.particleRadius = PARTICLE_RADIUS
+            print(f"✓ Set scene particleRadius = {PARTICLE_RADIUS}")
             
             # 第6步：添加流体块到场景（至少一个fluidBlock，保证initSimulation内就创建fluid model）
             self._setup_fluid_blocks()
@@ -663,10 +668,10 @@ class OpenGLRenderer:
         self.index_count = 0
         
         # Camera parameters
-        self.camera_distance = 16.0
+        self.camera_distance = 10.0
         self.camera_angle_x = 0.5
         self.camera_angle_y = 0.3
-        self.camera_target = [0.0, 0.0, 0.0]
+        self.camera_target = [0.0, 1.5, 0.0]
         
         # Mesh data - 预分配缓冲区
         self.vertices = []
@@ -691,10 +696,10 @@ class OpenGLRenderer:
 
         # SSFR quality/perf knobs
         self.ssfr_scale = 0.5          # 0.5 = 半分辨率（强烈建议，性价比最高）
-        self.ssfr_particle_radius_world = PARTICLE_RADIUS * 1.2  # 渲染半径略大于物理半径
-        self.ssfr_blur_sigma = 3.0     # 模糊强度（空间sigma，像素）
-        self.ssfr_blur_radius = 10     # kernel半径（separable）
-        self.ssfr_depth_sigma = 0.4    # 双边滤波深度sigma（世界空间单位）
+        self.ssfr_particle_radius_world = PARTICLE_RADIUS * 3.5  # 渲染半径 > 物理半径以确保深度缓冲覆盖
+        self.ssfr_blur_sigma = 5.0     # 模糊强度（空间sigma，像素）
+        self.ssfr_blur_radius = 15     # kernel半径（separable）
+        self.ssfr_depth_sigma = 0.15   # 双边滤波深度sigma（世界空间单位）
 
         # runtime size cache
         self._ssfr_w = 0
@@ -1122,6 +1127,7 @@ class OpenGLRenderer:
             // Schlick Fresnel — water F0 ≈ 0.02
             float F0 = 0.02;
             float fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, u_fresnel_power);
+            fresnel = min(fresnel, 0.85);  // 防止纯白反射
 
             // Thickness & Beer-Lambert absorption
             float thick = clamp(texture(u_thick, v_uv).r, 0.0, 10.0);
@@ -1527,6 +1533,9 @@ class OpenGLRenderer:
         view_inv   = np.linalg.inv(view).astype(np.float32)
 
         r_world = float(self.ssfr_particle_radius_world)
+
+        # 关键：启用着色器控制的点大小，否则 gl_PointSize 被忽略，粒子只有 1px
+        self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
 
         # ----------------------------------------------------------------
         # Pass 1 – Depth (sphere impostor → linear depth in R32F color tex)
@@ -1952,7 +1961,7 @@ class MainWindow(QMainWindow):
         camera_layout.addWidget(QLabel("距离:"))
         self.distance_slider = QSlider(Qt.Orientation.Horizontal)
         self.distance_slider.setRange(20, 200)  # 2.0 to 20.0
-        self.distance_slider.setValue(80)  # 8.0 default
+        self.distance_slider.setValue(100)  # 10.0 default
         self.distance_slider.valueChanged.connect(self.update_camera)
         camera_layout.addWidget(self.distance_slider)
         
@@ -1981,51 +1990,51 @@ class MainWindow(QMainWindow):
         ssfr_layout.addWidget(QLabel("粒子世界半径:"))
         self.ssfr_radius_slider = QSlider(Qt.Orientation.Horizontal)
         self.ssfr_radius_slider.setRange(5, 100)  # 0.05 to 1.00
-        radius_slider_init = int(PARTICLE_RADIUS * 1.2 * 100)
+        radius_slider_init = int(PARTICLE_RADIUS * 3.5 * 100)
         self.ssfr_radius_slider.setValue(radius_slider_init)
         self.ssfr_radius_slider.valueChanged.connect(self.update_ssfr_params)
         ssfr_layout.addWidget(self.ssfr_radius_slider)
-        self.ssfr_radius_label = QLabel(f"{PARTICLE_RADIUS * 1.2:.2f}")
+        self.ssfr_radius_label = QLabel(f"{PARTICLE_RADIUS * 3.5:.2f}")
         ssfr_layout.addWidget(self.ssfr_radius_label)
 
         # 模糊强度（空间sigma，像素）
         ssfr_layout.addWidget(QLabel("模糊强度:"))
         self.ssfr_sigma_slider = QSlider(Qt.Orientation.Horizontal)
         self.ssfr_sigma_slider.setRange(5, 80)  # 0.5 to 8.0
-        self.ssfr_sigma_slider.setValue(30)      # 3.0 default
+        self.ssfr_sigma_slider.setValue(50)      # 5.0 default
         self.ssfr_sigma_slider.valueChanged.connect(self.update_ssfr_params)
         ssfr_layout.addWidget(self.ssfr_sigma_slider)
-        self.ssfr_sigma_label = QLabel("3.0")
+        self.ssfr_sigma_label = QLabel("5.0")
         ssfr_layout.addWidget(self.ssfr_sigma_label)
 
         # 双边滤波深度sigma（世界空间单位）
         ssfr_layout.addWidget(QLabel("深度sigma(世界单位):"))
         self.ssfr_depth_sigma_slider = QSlider(Qt.Orientation.Horizontal)
         self.ssfr_depth_sigma_slider.setRange(1, 100)  # 0.1 to 10.0
-        self.ssfr_depth_sigma_slider.setValue(4)        # 0.4 default
+        self.ssfr_depth_sigma_slider.setValue(2)        # 0.2 default
         self.ssfr_depth_sigma_slider.valueChanged.connect(self.update_ssfr_params)
         ssfr_layout.addWidget(self.ssfr_depth_sigma_slider)
-        self.ssfr_depth_sigma_label = QLabel("0.4")
+        self.ssfr_depth_sigma_label = QLabel("0.2")
         ssfr_layout.addWidget(self.ssfr_depth_sigma_label)
         
         # 吸收系数
         ssfr_layout.addWidget(QLabel("吸收系数:"))
         self.ssfr_absorption_slider = QSlider(Qt.Orientation.Horizontal)
         self.ssfr_absorption_slider.setRange(5, 50)  # 0.5 to 5.0
-        self.ssfr_absorption_slider.setValue(23)  # 2.3 default
+        self.ssfr_absorption_slider.setValue(40)  # 4.0 default
         self.ssfr_absorption_slider.valueChanged.connect(self.update_ssfr_params)
         ssfr_layout.addWidget(self.ssfr_absorption_slider)
-        self.ssfr_absorption_label = QLabel("2.3")
+        self.ssfr_absorption_label = QLabel("4.0")
         ssfr_layout.addWidget(self.ssfr_absorption_label)
         
         # 散射系数
         ssfr_layout.addWidget(QLabel("散射系数:"))
         self.ssfr_scatter_slider = QSlider(Qt.Orientation.Horizontal)
         self.ssfr_scatter_slider.setRange(1, 20)  # 0.1 to 2.0
-        self.ssfr_scatter_slider.setValue(6)  # 0.55 default
+        self.ssfr_scatter_slider.setValue(2)  # 0.2 default
         self.ssfr_scatter_slider.valueChanged.connect(self.update_ssfr_params)
         ssfr_layout.addWidget(self.ssfr_scatter_slider)
-        self.ssfr_scatter_label = QLabel("0.55")
+        self.ssfr_scatter_label = QLabel("0.20")
         ssfr_layout.addWidget(self.ssfr_scatter_label)
         
         ssfr_group.setLayout(ssfr_layout)
