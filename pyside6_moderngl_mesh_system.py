@@ -699,7 +699,7 @@ class OpenGLRenderer:
         self.ssfr_particle_radius_world = PARTICLE_RADIUS * 3.5  # 渲染半径 > 物理半径以确保深度缓冲覆盖
         self.ssfr_blur_sigma = 5.0     # 模糊强度（空间sigma，像素）
         self.ssfr_blur_radius = 15     # kernel半径（separable）
-        self.ssfr_depth_sigma = 0.15   # 双边滤波深度sigma（世界空间单位）
+        self.ssfr_depth_sigma = 0.2    # 双边滤波深度sigma（世界空间单位）
 
         # runtime size cache
         self._ssfr_w = 0
