@@ -1,0 +1,90 @@
+"""
+系统配置和常量定义
+System Configuration and Constants
+"""
+
+import numpy as np
+
+class Config:
+    """系统配置类"""
+    
+    # 物理仿真参数
+    PARTICLE_RADIUS = 0.05
+    MAX_PARTICLES = 30000
+    H = PARTICLE_RADIUS * 2.0
+    
+    # 网格参数
+    MC_GRID_RES = 16
+    GRID_REBUILD_INTERVAL = 1
+    MC_MESH_UPDATE_INTERVAL = 1
+    
+    # SSFR参数
+    SHADOW_MAP_SIZE = 512
+    BATCH_SIZE = 1000
+    VERTEX_BUFFER_SIZE = 50000
+    INDEX_BUFFER_SIZE = 100000
+    
+    # 性能优化参数
+    ENABLE_PERFORMANCE_PROFILING = True
+    ENABLE_DETAILED_PERFORMANCE_CAPTURE = True
+    ENABLE_ADVANCED_PERFORMANCE_ANALYSIS = True
+    PERFORMANCE_HISTORY_SIZE = 1000
+    PERFORMANCE_SAMPLING_RATE = 5
+    ENABLE_REALTIME_ANALYSIS = True
+    ENABLE_MEMORY_PROFILING = True
+    ENABLE_GPU_PROFILING = True
+    
+    # 边界参数
+    BOUNDARY_MIN = np.array([-1.0, -1.0, -1.0], dtype=np.float64)
+    BOUNDARY_MAX = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+    
+    # PySPlisHSPlasH配置
+    PYSPLISH_AVAILABLE = True
+    SPLASHSURF_AVAILABLE = True
+    USE_SSFR = True
+    
+    # 时间步长配置
+    DEFAULT_TIME_STEP = 0.008
+    MIN_TIME_STEP = 0.0002
+    MAX_TIME_STEP = 0.005
+    CFL_FACTOR = 0.25
+    
+    # DFSPH参数
+    DFSPH_MIN_ITERATIONS = 2
+    DFSPH_MAX_ITERATIONS = 50
+    DFSPH_MAX_ERROR = 0.05
+    DFSPH_MAX_ITERATIONS_V = 50
+    DFSPH_MAX_ERROR_V = 0.1
+    
+    # 渲染参数
+    CAMERA_DISTANCE = 10.0
+    CAMERA_ANGLE_X = 0.5
+    CAMERA_ANGLE_Y = 0.3
+    CAMERA_TARGET = [0.0, 1.5, 0.0]
+    
+    # SSFR渲染参数
+    SSFR_SCALE = 1.0
+    SSFR_FILTER_ITERATIONS = 5
+    SSFR_FILTER_INTERVALS = [1, 2, 4, 8, 16]
+    SSFR_BLUR_SIGMA = 8.0
+    SSFR_DEPTH_SIGMA = 0.025
+    SSFR_BLUR_RADIUS = 4
+    SSFR_PARTICLE_RADIUS_WORLD = PARTICLE_RADIUS * 1.2
+    
+    # 光照参数
+    LIGHT_POSITION = np.array([3.5, 7.0, 3.5], dtype=np.float32)
+    LIGHT_TARGET = np.array([0.0, 1.5, 0.0], dtype=np.float32)
+    
+    # 材质参数
+    WATER_COLOR = (0.04, 0.28, 0.60)
+    ALPHA_BASE = 0.08
+    FRESNEL_POWER = 4.0
+    SPEC_POWER = 150.0
+    SIGMA_A = 3.5
+    SIGMA_S = 0.15
+    SHADOW_STRENGTH = 0.55
+    CAUSTIC_STRENGTH = 0.5
+    CAUSTIC_POWER = 0.6
+
+# 全局配置实例
+CONFIG = Config()

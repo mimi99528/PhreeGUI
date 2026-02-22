@@ -3,5 +3,11 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/SPlisHSPlasH" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/SPlisHSPlasH/build/temp.win-amd64-cpython-312/Release/extern/Discregrid/src/Ext_Discregrid" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/SPlisHSPlasH/build/temp.win-amd64-cpython-312/Release/extern/GenericParameters/src/Ext_GenericParameters" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/SPlisHSPlasH/build/temp.win-amd64-cpython-312/Release/extern/PositionBasedDynamics/src/Ext_PBD" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/SPlisHSPlasH/extern/cuNSearch" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/SPlisHSPlasH/extern/cuNSearch/src/Ext_NeighborhoodSearch" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/SPlisHSPlasH/extern/pybind" vcs="Git" />
   </component>
 </project>
