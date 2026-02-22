@@ -33,8 +33,17 @@ class OpenGLRenderer:
 
         # 深度图保存相关变量
         self.last_depth_save_time = 0
-        self.depth_save_interval = 1.0
+        self.depth_save_interval = CONFIG.DEPTH_SAVE_INTERVAL
         self.depth_frame_counter = 0
+        self.depth_save_enabled = CONFIG.ENABLE_DEPTH_TEXTURE_SAVE
+        self.depth_save_path = CONFIG.DEPTH_SAVE_PATH
+        self.depth_save_format = CONFIG.DEPTH_SAVE_FORMAT
+        self.depth_normalize_range = CONFIG.DEPTH_NORMALIZE_RANGE
+        
+        # 创建保存目录
+        import os
+        if self.depth_save_enabled:
+            os.makedirs(self.depth_save_path, exist_ok=True)
 
         # 顶点和索引计数
         self.vertex_count = 0
@@ -819,45 +828,16 @@ class OpenGLRenderer:
             p['u_point_scale'].value = 1.0
             self.particle_vao_depth.render(mode=moderngl.POINTS, vertices=self.particle_count)
 
-        # Pass 2 - Bilateral filtering
+        # Pass 2 - Bilateral filtering with clean ping-pong logic
         self.ctx.disable(moderngl.DEPTH_TEST)
-
-        bp = self.bilateral_prog
-        bp['u_texel'].value = (1.0 / self._ssfr_w, 1.0 / self._ssfr_h)
-        bp['u_sigma_xy'].value = float(self.ssfr_blur_sigma)
-        bp['u_sigma_z'].value = float(self.ssfr_depth_sigma)
-
-        # 5x5 kernel iterations
-        bp['u_kernel_radius'].value = 2
-        for i, interval in enumerate(self.ssfr_filter_intervals):
-            src_tex = self.depth_tex0 if (i % 2 == 0) else self.depth_tex1
-            dst_fbo = self.depth_fbo1 if (i % 2 == 0) else self.depth_fbo0
-
-            dst_fbo.use()
-            self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
-            self.ctx.clear(0.0, 0.0, 0.0, 0.0)
-
-            bp['u_filter_interval'].value = interval
-            src_tex.use(location=0)
-            bp['u_depth'].value = 0
-            self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
-
-        # 9x9 kernel refinement
-        bp['u_kernel_radius'].value = 4
-        bp['u_filter_interval'].value = 1
-
-        self.depth_fbo0.use()
-        self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
-        self.ctx.clear(0.0, 0.0, 0.0, 0.0)
-
-        self.depth_tex1.use(location=0)
-        bp['u_depth'].value = 0
-        self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
+        
+        # Perform bilateral filtering with proper ping-pong
+        final_depth_tex = self._filter_depth_passes()
 
         # Save depth texture if needed
         current_time = time.time()
         if current_time - self.last_depth_save_time >= self.depth_save_interval:
-            self._save_depth_texture()
+            self._save_depth_texture("depth_tex0")
             self.last_depth_save_time = current_time
             self.depth_frame_counter += 1
 
@@ -987,6 +967,194 @@ class OpenGLRenderer:
             except Exception:
                 pass
 
-    def _save_depth_texture(self):
-        """保存深度纹理（占位方法）"""
-        pass
+    def _filter_depth_passes(self):
+        """执行双边滤波，返回最终的深度纹理"""
+        bp = self.bilateral_prog
+        bp['u_texel'].value = (1.0 / self._ssfr_w, 1.0 / self._ssfr_h)
+        bp['u_sigma_xy'].value = float(self.ssfr_blur_sigma)
+        bp['u_sigma_z'].value = float(self.ssfr_depth_sigma)
+        
+        # 初始化乒乓缓冲
+        src_tex = self.depth_tex0
+        dst_fbo = self.depth_fbo1
+
+        # 执行5x5核的滤波迭代，间隔按指数增长
+        bp['u_kernel_radius'].value = 2
+        base_interval = 1
+        for i in range(1, 6):  # 固定5次滤波
+            interval = base_interval * (2 ** i)  # 间隔指数增长: 1, 2, 4, 8, 16
+            dst_fbo.use()
+            self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
+            self.ctx.clear(0.0, 0.0, 0.0, 0.0)
+            
+            bp['u_filter_interval'].value = interval
+            src_tex.use(location=0)
+            bp['u_depth'].value = 0
+            self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
+            # self._save_depth_texture(src_tex)
+            # 乒乓交换
+            src_tex, dst_fbo = (
+                self.depth_tex1 if src_tex == self.depth_tex0 else self.depth_tex0,
+                self.depth_fbo0 if dst_fbo == self.depth_fbo1 else self.depth_fbo1
+            )
+        
+        # 最终用等效64x64核大小进行一次滤波 (间隔为32)
+        bp['u_kernel_radius'].value = 2
+        dst_fbo.use()
+        self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
+        self.ctx.clear(0.0, 0.0, 0.0, 0.0)
+        
+        bp['u_filter_interval'].value = 32  # 间隔32相当于64x64核
+        src_tex.use(location=0)
+        bp['u_depth'].value = 0
+        self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
+        # self._save_depth_texture(src_tex)
+        # 乒乓交换确保最终结果在depth_tex0中
+        src_tex, dst_fbo = (
+            self.depth_tex1 if src_tex == self.depth_tex0 else self.depth_tex0,
+            self.depth_fbo0 if dst_fbo == self.depth_fbo1 else self.depth_fbo1
+        )
+        # 9x9核精炼
+        bp['u_kernel_radius'].value = 4
+        bp['u_filter_interval'].value = 1
+        
+        # 确保9x9精炼写入到depth_fbo0
+        self.depth_fbo0.use()
+        self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
+        self.ctx.clear(0.0, 0.0, 0.0, 0.0)
+        
+        # 根据当前src_tex选择正确的输入纹理
+        input_tex = src_tex  # 这是上一步的输出纹理
+        input_tex.use(location=0)
+        bp['u_depth'].value = 0
+        self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
+        # 确保最终结果在depth_tex0中
+        final_tex = self.depth_tex0
+        # self._save_depth_texture(final_tex)
+        
+        # 如果迭代次数为奇数，最终数据在depth_tex1中，需要拷贝到depth_tex0
+        if len(self.ssfr_filter_intervals) % 2 == 1:
+            # 数据在depth_tex1，需要拷贝到depth_tex0
+            self.depth_fbo0.use()
+            self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
+            self.ctx.clear(0.0, 0.0, 0.0, 0.0)
+            
+            bp['u_filter_interval'].value = 1
+            bp['u_kernel_radius'].value = 0  # 1x1核，纯拷贝
+            self.depth_tex1.use(location=0)
+            bp['u_depth'].value = 0
+            self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
+            final_tex = self.depth_tex0
+
+        return final_tex
+
+    def _save_depth_texture(self, name):
+        """保存深度纹理到文件"""
+        if not self.depth_save_enabled or not hasattr(self, 'depth_tex0') or self.depth_tex0 is None:
+            return
+        
+        try:
+            import os
+            import datetime
+            
+            # 从GPU读取深度纹理数据
+            depth_data = self._read_depth_texture(name)
+            if depth_data is None:
+                return
+            
+            # 生成文件名
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            frame_num = self.depth_frame_counter
+            filename = f"depth_frame_{frame_num:06d}_{timestamp}.{self.depth_save_format}"
+            filepath = os.path.join(self.depth_save_path, filename)
+            
+            # 保存数据
+            if self.depth_save_format.lower() == 'png':
+                self._save_depth_as_png(depth_data, filepath)
+            elif self.depth_save_format.lower() == 'npy':
+                self._save_depth_as_npy(depth_data, filepath)
+            else:
+                # 默认保存为PNG
+                self._save_depth_as_png(depth_data, filepath)
+            
+            print(f"✓ 深度纹理已保存: {filepath}")
+            
+        except Exception as e:
+            print(f"✗ 深度纹理保存失败: {e}")
+    
+    def _read_depth_texture(self, name):
+        """从GPU读取深度纹理数据"""
+        try:
+            # 确保有有效的深度纹理
+            try:
+                target = getattr(self, name, None)
+            except:
+                target = name
+            if target is None:
+                print("✗ 深度纹理未初始化")
+                return None
+            
+            # 获取纹理尺寸
+            width, height = target.size
+            
+            # 创建临时FBO来读取纹理数据
+            temp_fbo = self.ctx.framebuffer(color_attachments=[target])
+            
+            # 读取浮点数据
+            depth_bytes = temp_fbo.read(
+                viewport=(0, 0, width, height),
+                components=1,
+                dtype='f4'
+            )
+            
+            # 释放临时FBO
+            temp_fbo.release()
+            
+            # 转换为numpy数组
+            import numpy as np
+            depth_data = np.frombuffer(depth_bytes, dtype=np.float32)
+            depth_data = depth_data.reshape((height, width))
+            
+            return depth_data
+            
+        except Exception as e:
+            print(f"✗ 读取深度纹理失败: {e}")
+            return None
+    
+    def _save_depth_as_png(self, depth_data, filepath):
+        """将深度数据保存为PNG格式"""
+        try:
+            import numpy as np
+            from PIL import Image
+            
+            # 处理深度数据
+            if self.depth_normalize_range:
+                # 归一化到[0,1]范围
+                depth_min = np.min(depth_data[depth_data > 0]) if np.any(depth_data > 0) else 0
+                depth_max = np.max(depth_data)
+                if depth_max > depth_min:
+                    normalized = (depth_data - depth_min) / (depth_max - depth_min)
+                else:
+                    normalized = depth_data
+                # 转换为8位灰度图像
+                image_data = (normalized * 255).astype(np.uint8)
+            else:
+                # 直接转换，可能丢失精度
+                image_data = (depth_data * 255).astype(np.uint8)
+            
+            # 创建并保存图像
+            image = Image.fromarray(image_data, mode='L')
+            image.save(filepath, format='PNG', compress_level=1)
+            
+        except Exception as e:
+            print(f"✗ 保存PNG失败: {e}")
+            raise
+    
+    def _save_depth_as_npy(self, depth_data, filepath):
+        """将深度数据保存为NumPy格式"""
+        try:
+            import numpy as np
+            np.save(filepath, depth_data)
+        except Exception as e:
+            print(f"✗ 保存NPY失败: {e}")
+            raise

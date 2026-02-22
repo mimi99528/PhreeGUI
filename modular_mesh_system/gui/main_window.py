@@ -95,47 +95,106 @@ class MainWindow(QMainWindow):
         self.setup_timer()
 
     def init_ui(self):
-        """Initialize UI with separated panels"""
+        """Initialize UI with proper layout"""
         self.setWindowTitle("PySide6 + ModernGL 网格重建系统")
-        self.setGeometry(100, 100, 1400, 800)
+        self.setGeometry(100, 100, 1400, 900)
 
         # Create central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
-        # Main horizontal layout
-        main_layout = QHBoxLayout(central_widget)
+        # Main vertical layout
+        main_layout = QVBoxLayout(central_widget)
         main_layout.setSpacing(5)
         main_layout.setContentsMargins(5, 5, 5, 5)
 
-        # Left control panel
-        control_panel = self.create_control_panel()
-        main_layout.addWidget(control_panel, stretch=0)
-
-        # Center area - OpenGL widget and performance panel splitter
-        center_splitter = QSplitter(Qt.Orientation.Vertical)
-        
-        # OpenGL widget
+        # Top area - OpenGL widget (占主要空间)
         self.opengl_widget = QOpenGLWidgetWrapper(self.opengl_renderer)
-        center_splitter.addWidget(self.opengl_widget)
-        
-        # Performance panel
-        performance_panel = self.create_performance_panel()
-        center_splitter.addWidget(performance_panel)
-        
-        # Set initial sizes
-        center_splitter.setSizes([700, 300])
-        
-        main_layout.addWidget(center_splitter, stretch=1)
+        main_layout.addWidget(self.opengl_widget, stretch=3)  # 给OpenGL更多空间
+
+        # Bottom area - Control panel with tabs (固定高度)
+        bottom_panel = self.create_bottom_control_panel()
+        main_layout.addWidget(bottom_panel, stretch=3)  # 控制面板较少空间
 
         # Status bar
         self.status_bar = self.statusBar()
         self.status_bar.showMessage("系统就绪")
 
-    def create_control_panel(self):
-        """Create control panel"""
+    def update_material_params(self):
+        """Update material parameters for SSFR rendering"""
+        # Update alpha base
+        if hasattr(self, 'alpha_base_slider'):
+            alpha_base = self.alpha_base_slider.value() / 100.0
+            CONFIG.ALPHA_BASE = alpha_base
+            self.alpha_base_label.setText(f"{alpha_base:.2f}")
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_alpha_base' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_alpha_base'].value = alpha_base
+
+        # Update fresnel power
+        if hasattr(self, 'fresnel_power_slider'):
+            fresnel_power = self.fresnel_power_slider.value() / 10.0
+            CONFIG.FRESNEL_POWER = fresnel_power
+            self.fresnel_power_label.setText(f"{fresnel_power:.1f}")
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_fresnel_power' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_fresnel_power'].value = fresnel_power
+
+        # Update specular power
+        if hasattr(self, 'spec_power_slider'):
+            spec_power = float(self.spec_power_slider.value())
+            CONFIG.SPEC_POWER = spec_power
+            self.spec_power_label.setText(f"{spec_power:.0f}")
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_spec_power' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_spec_power'].value = spec_power
+
+        # Update absorption coefficient
+        if hasattr(self, 'sigma_a_slider'):
+            sigma_a = self.sigma_a_slider.value() / 10.0
+            CONFIG.SIGMA_A = sigma_a
+            self.sigma_a_label.setText(f"{sigma_a:.1f}")
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_sigma_a' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_sigma_a'].value = sigma_a
+
+        # Update scattering coefficient
+        if hasattr(self, 'sigma_s_slider'):
+            sigma_s = self.sigma_s_slider.value() / 100.0
+            CONFIG.SIGMA_S = sigma_s
+            self.sigma_s_label.setText(f"{sigma_s:.2f}")
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_sigma_s' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_sigma_s'].value = sigma_s
+
+        # Update shadow strength
+        if hasattr(self, 'shadow_strength_slider'):
+            shadow_strength = self.shadow_strength_slider.value() / 100.0
+            CONFIG.SHADOW_STRENGTH = shadow_strength
+            self.shadow_strength_label.setText(f"{shadow_strength:.2f}")
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_shadow_strength' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_shadow_strength'].value = shadow_strength
+
+        # Update caustic strength
+        if hasattr(self, 'caustic_strength_slider'):
+            caustic_strength = self.caustic_strength_slider.value() / 100.0
+            CONFIG.CAUSTIC_STRENGTH = caustic_strength
+            self.caustic_strength_label.setText(f"{caustic_strength:.2f}")
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_caustic_strength' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_caustic_strength'].value = caustic_strength
+
+        # Update caustic power
+        if hasattr(self, 'caustic_power_slider'):
+            caustic_power = self.caustic_power_slider.value() / 10.0
+            CONFIG.CAUSTIC_POWER = caustic_power
+            self.caustic_power_label.setText(f"{caustic_power:.1f}")
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_caustic_power' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_caustic_power'].value = caustic_power
+
+        # Trigger OpenGL widget update
+        self.opengl_widget.update()
+
+
+    def create_bottom_control_panel(self):
+        """Create bottom control panel with tabbed interface"""
         panel = QFrame()
-        panel.setFixedWidth(300)
+        panel.setMinimumHeight(300)  # 确保有足够的高度
+        panel.setMaximumHeight(600)  # 限制最大高度
         panel.setStyleSheet("""
             QFrame {
                 background-color: #2b2b2b;
@@ -143,14 +202,15 @@ class MainWindow(QMainWindow):
             }
             QLabel {
                 color: white;
-                font-size: 12px;
+                font-size: 11px;
             }
             QPushButton {
                 background-color: #4a4a4a;
                 color: white;
                 border: 1px solid #666666;
-                padding: 8px;
-                font-size: 12px;
+                padding: 6px;
+                font-size: 11px;
+                min-width: 80px;
             }
             QPushButton:hover {
                 background-color: #5a5a5a;
@@ -168,16 +228,75 @@ class MainWindow(QMainWindow):
                 background-color: #4a4a4a;
                 color: white;
                 border: 1px solid #666666;
+                min-width: 100px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #444444;
+                background-color: #2b2b2b;
+            }
+            QTabBar::tab {
+                background-color: #3a3a3a;
+                color: white;
+                padding: 8px 15px;
+                margin: 2px;
+                border: 1px solid #555555;
+                border-bottom: none;
+            }
+            QTabBar::tab:selected {
+                background-color: #4a4a4a;
+                border-bottom: 2px solid #4fc3f7;
+            }
+            QGroupBox {
+                color: #4fc3f7;
+                font-weight: bold;
+                border: 1px solid #555555;
+                margin-top: 1ex;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
             }
         """)
 
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
-        # Title
+        # Panel title
         title = QLabel("控制面板")
-        title.setStyleSheet("color: #4fc3f7; font-size: 16px; font-weight: bold;")
+        title.setStyleSheet("color: #4fc3f7; font-size: 14px; font-weight: bold;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
+
+        # Tab widget for organized controls
+        tab_widget = QTabWidget()
+        
+        # Simulation Control Tab
+        sim_tab = self.create_simulation_tab()
+        tab_widget.addTab(sim_tab, "模拟控制")
+        
+        # Rendering Parameters Tab
+        render_tab = self.create_rendering_tab()
+        tab_widget.addTab(render_tab, "渲染参数")
+        
+        # Advanced Settings Tab
+        advanced_tab = self.create_advanced_tab()
+        tab_widget.addTab(advanced_tab, "高级设置")
+        
+        # Statistics Tab
+        stats_tab = self.create_statistics_tab()
+        tab_widget.addTab(stats_tab, "统计信息")
+        
+        layout.addWidget(tab_widget)
+        return panel
+
+    def create_simulation_tab(self):
+        """Create simulation control tab"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
 
         # Control buttons
         button_layout = QHBoxLayout()
@@ -205,19 +324,17 @@ class MainWindow(QMainWindow):
         self.speed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.speed_label)
 
-        # Mesh toggle
+        # Display options
         self.mesh_toggle = QCheckBox("启用网格显示")
         self.mesh_toggle.setChecked(True)
         self.mesh_toggle.stateChanged.connect(self.toggle_mesh)
         layout.addWidget(self.mesh_toggle)
 
-        # Rendering mode toggle
-        self.render_mode_toggle = QCheckBox("使用SSFR渲染(直接粒子渲染)")
+        self.render_mode_toggle = QCheckBox("使用SSFR渲染")
         self.render_mode_toggle.setChecked(True)
         self.render_mode_toggle.stateChanged.connect(self.toggle_render_mode)
         layout.addWidget(self.render_mode_toggle)
 
-        # Boundary handling toggle
         self.boundary_toggle = QCheckBox("启用边界碰撞")
         self.boundary_toggle.setChecked(True)
         self.boundary_toggle.stateChanged.connect(self.toggle_boundary)
@@ -230,8 +347,37 @@ class MainWindow(QMainWindow):
         self.display_combo.setCurrentText("实体")
         layout.addWidget(self.display_combo)
 
-        # Camera controls
-        camera_group = QGroupBox("相机控制")
+        layout.addStretch()
+        return widget
+
+    def create_rendering_tab(self):
+        """Create rendering parameters tab with separate tabs for camera and SSFR controls"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
+
+        # Create tab widget for organizing controls
+        tab_widget = QTabWidget()
+        
+        # Camera Controls Tab
+        camera_tab = self.create_camera_controls_tab()
+        tab_widget.addTab(camera_tab, "相机控制")
+        
+        # SSFR Parameters Tab
+        ssfr_tab = self.create_ssfr_parameters_tab()
+        tab_widget.addTab(ssfr_tab, "SSFR参数")
+        
+        layout.addWidget(tab_widget)
+        return widget
+
+    def create_camera_controls_tab(self):
+        """Create camera controls tab"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
+
+        # Camera controls group
+        camera_group = QGroupBox("相机参数")
         camera_layout = QVBoxLayout()
 
         camera_layout.addWidget(QLabel("距离:"))
@@ -257,77 +403,253 @@ class MainWindow(QMainWindow):
 
         camera_group.setLayout(camera_layout)
         layout.addWidget(camera_group)
+        layout.addStretch()
+        return widget
+    def create_ssfr_parameters_tab(self):
+        """Create SSFR parameters tab with balanced two-column layout"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
 
-        # SSFR 参数调节
-        ssfr_group = QGroupBox("SSFR参数调节")
-        ssfr_layout = QVBoxLayout()
+        # SSFR parameters group
+        ssfr_group = QGroupBox("SSFR渲染参数")
+        ssfr_layout = QGridLayout()
+        ssfr_layout.setSpacing(15)
 
-        ssfr_layout.addWidget(QLabel("粒子世界半径:"))
-        self.ssfr_radius_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ssfr_radius_slider.setRange(5, 100)
-        radius_slider_init = int(CONFIG.PARTICLE_RADIUS * 3.5 * 100)
-        self.ssfr_radius_slider.setValue(radius_slider_init)
-        self.ssfr_radius_slider.valueChanged.connect(self.update_ssfr_params)
-        ssfr_layout.addWidget(self.ssfr_radius_slider)
-        self.ssfr_radius_label = QLabel(f"{CONFIG.PARTICLE_RADIUS * 3.5:.2f}")
-        ssfr_layout.addWidget(self.ssfr_radius_label)
+        # Column 1 - Optical Properties
+        col1_layout = QVBoxLayout()
+        
+        # Alpha base
+        col1_layout.addWidget(QLabel("基础透明度:"))
+        self.alpha_base_slider = QSlider(Qt.Orientation.Horizontal)
+        self.alpha_base_slider.setRange(1, 50)
+        self.alpha_base_slider.setValue(int(CONFIG.ALPHA_BASE * 100))
+        self.alpha_base_slider.valueChanged.connect(self.update_material_params)
+        col1_layout.addWidget(self.alpha_base_slider)
+        self.alpha_base_label = QLabel(f"{CONFIG.ALPHA_BASE:.2f}")
+        col1_layout.addWidget(self.alpha_base_label)
+        
+        # Fresnel power
+        col1_layout.addWidget(QLabel("菲涅尔幂次:"))
+        self.fresnel_power_slider = QSlider(Qt.Orientation.Horizontal)
+        self.fresnel_power_slider.setRange(1, 200)
+        self.fresnel_power_slider.setValue(int(CONFIG.FRESNEL_POWER * 10))
+        self.fresnel_power_slider.valueChanged.connect(self.update_material_params)
+        col1_layout.addWidget(self.fresnel_power_slider)
+        self.fresnel_power_label = QLabel(f"{CONFIG.FRESNEL_POWER:.1f}")
+        col1_layout.addWidget(self.fresnel_power_label)
+        
+        # Specular power
+        col1_layout.addWidget(QLabel("镜面反射强度:"))
+        self.spec_power_slider = QSlider(Qt.Orientation.Horizontal)
+        self.spec_power_slider.setRange(10, 500)
+        self.spec_power_slider.setValue(int(CONFIG.SPEC_POWER))
+        self.spec_power_slider.valueChanged.connect(self.update_material_params)
+        col1_layout.addWidget(self.spec_power_slider)
+        self.spec_power_label = QLabel(f"{CONFIG.SPEC_POWER:.0f}")
+        col1_layout.addWidget(self.spec_power_label)
 
-        ssfr_layout.addWidget(QLabel("模糊强度:"))
-        self.ssfr_sigma_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ssfr_sigma_slider.setRange(5, 80)
-        self.ssfr_sigma_slider.setValue(50)
-        self.ssfr_sigma_slider.valueChanged.connect(self.update_ssfr_params)
-        ssfr_layout.addWidget(self.ssfr_sigma_slider)
-        self.ssfr_sigma_label = QLabel("5.0")
-        ssfr_layout.addWidget(self.ssfr_sigma_label)
+        # Column 2 - Medium Properties
+        col2_layout = QVBoxLayout()
+        
+        # Absorption coefficient
+        col2_layout.addWidget(QLabel("吸收系数:"))
+        self.sigma_a_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sigma_a_slider.setRange(5, 50)
+        self.sigma_a_slider.setValue(int(CONFIG.SIGMA_A * 10))
+        self.sigma_a_slider.valueChanged.connect(self.update_material_params)
+        col2_layout.addWidget(self.sigma_a_slider)
+        self.sigma_a_label = QLabel(f"{CONFIG.SIGMA_A:.1f}")
+        col2_layout.addWidget(self.sigma_a_label)
+        
+        # Scattering coefficient
+        col2_layout.addWidget(QLabel("散射系数:"))
+        self.sigma_s_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sigma_s_slider.setRange(1, 50)
+        self.sigma_s_slider.setValue(int(CONFIG.SIGMA_S * 100))
+        self.sigma_s_slider.valueChanged.connect(self.update_material_params)
+        col2_layout.addWidget(self.sigma_s_slider)
+        self.sigma_s_label = QLabel(f"{CONFIG.SIGMA_S:.2f}")
+        col2_layout.addWidget(self.sigma_s_label)
+        
+        # Shadow strength
+        col2_layout.addWidget(QLabel("阴影强度:"))
+        self.shadow_strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self.shadow_strength_slider.setRange(0, 100)
+        self.shadow_strength_slider.setValue(int(CONFIG.SHADOW_STRENGTH * 100))
+        self.shadow_strength_slider.valueChanged.connect(self.update_material_params)
+        col2_layout.addWidget(self.shadow_strength_slider)
+        self.shadow_strength_label = QLabel(f"{CONFIG.SHADOW_STRENGTH:.2f}")
+        col2_layout.addWidget(self.shadow_strength_label)
 
-        ssfr_layout.addWidget(QLabel("深度sigma(世界单位):"))
-        self.ssfr_depth_sigma_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ssfr_depth_sigma_slider.setRange(1, 100)
-        self.ssfr_depth_sigma_slider.setValue(2)
-        self.ssfr_depth_sigma_slider.valueChanged.connect(self.update_ssfr_params)
-        ssfr_layout.addWidget(self.ssfr_depth_sigma_slider)
-        self.ssfr_depth_sigma_label = QLabel("0.2")
-        ssfr_layout.addWidget(self.ssfr_depth_sigma_label)
+        # Column 3 - Light Effects
+        col3_layout = QVBoxLayout()
+        
+        # Caustic strength
+        col3_layout.addWidget(QLabel("焦散强度:"))
+        self.caustic_strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self.caustic_strength_slider.setRange(0, 100)
+        self.caustic_strength_slider.setValue(int(CONFIG.CAUSTIC_STRENGTH * 100))
+        self.caustic_strength_slider.valueChanged.connect(self.update_material_params)
+        col3_layout.addWidget(self.caustic_strength_slider)
+        self.caustic_strength_label = QLabel(f"{CONFIG.CAUSTIC_STRENGTH:.2f}")
+        col3_layout.addWidget(self.caustic_strength_label)
+        
+        # Caustic power
+        col3_layout.addWidget(QLabel("焦散幂次:"))
+        self.caustic_power_slider = QSlider(Qt.Orientation.Horizontal)
+        self.caustic_power_slider.setRange(1, 200)
+        self.caustic_power_slider.setValue(int(CONFIG.CAUSTIC_POWER * 10))
+        self.caustic_power_slider.valueChanged.connect(self.update_material_params)
+        col3_layout.addWidget(self.caustic_power_slider)
+        self.caustic_power_label = QLabel(f"{CONFIG.CAUSTIC_POWER:.1f}")
+        col3_layout.addWidget(self.caustic_power_label)
 
-        ssfr_layout.addWidget(QLabel("吸收系数:"))
+        # Add columns to grid layout
+        ssfr_layout.addLayout(col1_layout, 0, 0)
+        ssfr_layout.addLayout(col2_layout, 0, 1)
+        ssfr_layout.addLayout(col3_layout, 0, 2)
+
+        ssfr_group.setLayout(ssfr_layout)
+        layout.addWidget(ssfr_group)
+        layout.addStretch()
+        return widget
+
+
+
+    def create_advanced_tab(self):
+        """Create advanced settings tab"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
+
+        # Material properties
+        material_group = QGroupBox("材质属性")
+        material_layout = QVBoxLayout()
+
+        material_layout.addWidget(QLabel("吸收系数:"))
         self.ssfr_absorption_slider = QSlider(Qt.Orientation.Horizontal)
         self.ssfr_absorption_slider.setRange(5, 50)
         self.ssfr_absorption_slider.setValue(40)
         self.ssfr_absorption_slider.valueChanged.connect(self.update_ssfr_params)
-        ssfr_layout.addWidget(self.ssfr_absorption_slider)
+        material_layout.addWidget(self.ssfr_absorption_slider)
         self.ssfr_absorption_label = QLabel("4.0")
-        ssfr_layout.addWidget(self.ssfr_absorption_label)
+        material_layout.addWidget(self.ssfr_absorption_label)
 
-        ssfr_layout.addWidget(QLabel("散射系数:"))
+        material_layout.addWidget(QLabel("散射系数:"))
         self.ssfr_scatter_slider = QSlider(Qt.Orientation.Horizontal)
         self.ssfr_scatter_slider.setRange(1, 20)
         self.ssfr_scatter_slider.setValue(2)
         self.ssfr_scatter_slider.valueChanged.connect(self.update_ssfr_params)
-        ssfr_layout.addWidget(self.ssfr_scatter_slider)
+        material_layout.addWidget(self.ssfr_scatter_slider)
         self.ssfr_scatter_label = QLabel("0.20")
-        ssfr_layout.addWidget(self.ssfr_scatter_label)
+        material_layout.addWidget(self.ssfr_scatter_label)
 
-        ssfr_group.setLayout(ssfr_layout)
-        layout.addWidget(ssfr_group)
+        material_group.setLayout(material_layout)
+        layout.addWidget(material_group)
 
-        # Basic statistics
-        stats_group = QGroupBox("基本统计")
-        stats_layout = QVBoxLayout()
+        # Water color controls
+        color_group = QGroupBox("水体颜色")
+        color_layout = QGridLayout()
 
-        self.frame_label = QLabel("帧: 0")
-        self.particle_label = QLabel("粒子数: 0")
-        self.fps_label = QLabel("FPS: 0")
+        color_layout.addWidget(QLabel("红色:"), 0, 0)
+        self.water_r_slider = QSlider(Qt.Orientation.Horizontal)
+        self.water_r_slider.setRange(0, 100)
+        self.water_r_slider.setValue(int(CONFIG.WATER_COLOR[0] * 100))
+        self.water_r_slider.valueChanged.connect(self.update_water_color)
+        color_layout.addWidget(self.water_r_slider, 0, 1)
+        self.water_r_label = QLabel(f"{CONFIG.WATER_COLOR[0]:.2f}")
+        color_layout.addWidget(self.water_r_label, 0, 2)
 
-        stats_layout.addWidget(self.frame_label)
-        stats_layout.addWidget(self.particle_label)
-        stats_layout.addWidget(self.fps_label)
+        color_layout.addWidget(QLabel("绿色:"), 1, 0)
+        self.water_g_slider = QSlider(Qt.Orientation.Horizontal)
+        self.water_g_slider.setRange(0, 100)
+        self.water_g_slider.setValue(int(CONFIG.WATER_COLOR[1] * 100))
+        self.water_g_slider.valueChanged.connect(self.update_water_color)
+        color_layout.addWidget(self.water_g_slider, 1, 1)
+        self.water_g_label = QLabel(f"{CONFIG.WATER_COLOR[1]:.2f}")
+        color_layout.addWidget(self.water_g_label, 1, 2)
 
-        stats_group.setLayout(stats_layout)
-        layout.addWidget(stats_group)
+        color_layout.addWidget(QLabel("蓝色:"), 2, 0)
+        self.water_b_slider = QSlider(Qt.Orientation.Horizontal)
+        self.water_b_slider.setRange(0, 100)
+        self.water_b_slider.setValue(int(CONFIG.WATER_COLOR[2] * 100))
+        self.water_b_slider.valueChanged.connect(self.update_water_color)
+        color_layout.addWidget(self.water_b_slider, 2, 1)
+        self.water_b_label = QLabel(f"{CONFIG.WATER_COLOR[2]:.2f}")
+        color_layout.addWidget(self.water_b_label, 2, 2)
+
+        color_group.setLayout(color_layout)
+        layout.addWidget(color_group)
 
         layout.addStretch()
-        return panel
+        return widget
+
+    def create_statistics_tab(self):
+        """Create statistics display tab"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
+
+        # Statistics grid
+        stats_grid = QGridLayout()
+        stats_grid.setSpacing(8)
+        
+        # Row 1
+        stats_grid.addWidget(QLabel("帧:"), 0, 0)
+        self.frame_label = QLabel("0")
+        stats_grid.addWidget(self.frame_label, 0, 1)
+        
+        stats_grid.addWidget(QLabel("粒子数:"), 0, 2)
+        self.particle_label = QLabel("0")
+        stats_grid.addWidget(self.particle_label, 0, 3)
+        
+        # Row 2
+        stats_grid.addWidget(QLabel("FPS:"), 1, 0)
+        self.fps_label = QLabel("0")
+        stats_grid.addWidget(self.fps_label, 1, 1)
+        
+        stats_grid.addWidget(QLabel("帧时间:"), 1, 2)
+        self.avg_frame_time_label = QLabel("0.00ms")
+        stats_grid.addWidget(self.avg_frame_time_label, 1, 3)
+        
+        # Row 3
+        stats_grid.addWidget(QLabel("网格重建:"), 2, 0)
+        self.grid_time_label = QLabel("0ms")
+        stats_grid.addWidget(self.grid_time_label, 2, 1)
+        
+        stats_grid.addWidget(QLabel("力计算:"), 2, 2)
+        self.force_time_label = QLabel("0ms")
+        stats_grid.addWidget(self.force_time_label, 2, 3)
+        
+        # Row 4
+        stats_grid.addWidget(QLabel("网格生成:"), 3, 0)
+        self.mesh_time_label = QLabel("0ms")
+        stats_grid.addWidget(self.mesh_time_label, 3, 1)
+        
+        stats_grid.addWidget(QLabel("GPU上传:"), 3, 2)
+        self.gpu_time_label = QLabel("0ms")
+        stats_grid.addWidget(self.gpu_time_label, 3, 3)
+        
+        layout.addLayout(stats_grid)
+        
+        # Additional info
+        info_group = QGroupBox("系统信息")
+        info_layout = QVBoxLayout()
+        
+        self.memory_label = QLabel("内存使用: 0MB")
+        self.vertex_label = QLabel("顶点数: 0")
+        self.triangle_label = QLabel("三角形数: 0")
+        
+        info_layout.addWidget(self.memory_label)
+        info_layout.addWidget(self.vertex_label)
+        info_layout.addWidget(self.triangle_label)
+        
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+        
+        layout.addStretch()
+        return widget
 
     def create_performance_panel(self):
         """Create performance analysis panel"""
@@ -673,29 +995,54 @@ class MainWindow(QMainWindow):
 
     def update_ssfr_params(self):
         """Update SSFR rendering parameters"""
-        radius = self.ssfr_radius_slider.value() / 100.0
-        self.opengl_renderer.ssfr_particle_radius_world = radius
-        self.ssfr_radius_label.setText(f"{radius:.2f}")
+        # Update basic SSFR parameters
+        if hasattr(self, 'ssfr_radius_slider'):
+            radius = self.ssfr_radius_slider.value() / 100.0
+            self.opengl_renderer.ssfr_particle_radius_world = radius
+            self.ssfr_radius_label.setText(f"{radius:.2f}")
 
-        sigma = self.ssfr_sigma_slider.value() / 10.0
-        self.opengl_renderer.ssfr_blur_sigma = sigma
-        self.ssfr_sigma_label.setText(f"{sigma:.1f}")
+        if hasattr(self, 'ssfr_sigma_slider'):
+            sigma = self.ssfr_sigma_slider.value() / 10.0
+            self.opengl_renderer.ssfr_blur_sigma = sigma
+            self.ssfr_sigma_label.setText(f"{sigma:.1f}")
 
-        depth_sigma = self.ssfr_depth_sigma_slider.value() / 10.0
-        self.opengl_renderer.ssfr_depth_sigma = depth_sigma
-        self.ssfr_depth_sigma_label.setText(f"{depth_sigma:.2f}")
+        if hasattr(self, 'ssfr_depth_sigma_slider'):
+            depth_sigma = self.ssfr_depth_sigma_slider.value() / 10.0
+            self.opengl_renderer.ssfr_depth_sigma = depth_sigma
+            self.ssfr_depth_sigma_label.setText(f"{depth_sigma:.2f}")
 
-        absorption = self.ssfr_absorption_slider.value() / 10.0
-        if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_sigma_a' in self.opengl_renderer.composite_prog.uniforms:
-            self.opengl_renderer.composite_prog['u_sigma_a'].value = absorption
-        self.ssfr_absorption_label.setText(f"{absorption:.1f}")
+        # Update material properties
+        if hasattr(self, 'ssfr_absorption_slider'):
+            absorption = self.ssfr_absorption_slider.value() / 10.0
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_sigma_a' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_sigma_a'].value = absorption
+            self.ssfr_absorption_label.setText(f"{absorption:.1f}")
 
-        scatter = self.ssfr_scatter_slider.value() / 10.0
-        if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_sigma_s' in self.opengl_renderer.composite_prog.uniforms:
-            self.opengl_renderer.composite_prog['u_sigma_s'].value = scatter
-        self.ssfr_scatter_label.setText(f"{scatter:.2f}")
+        if hasattr(self, 'ssfr_scatter_slider'):
+            scatter = self.ssfr_scatter_slider.value() / 10.0
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_sigma_s' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_sigma_s'].value = scatter
+            self.ssfr_scatter_label.setText(f"{scatter:.2f}")
 
         self.opengl_widget.update()
+
+    def update_water_color(self):
+        """Update water color parameters"""
+        if hasattr(self, 'water_r_slider') and hasattr(self, 'water_g_slider') and hasattr(self, 'water_b_slider'):
+            r = self.water_r_slider.value() / 100.0
+            g = self.water_g_slider.value() / 100.0
+            b = self.water_b_slider.value() / 100.0
+            
+            CONFIG.WATER_COLOR = (r, g, b)
+            self.water_r_label.setText(f"{r:.2f}")
+            self.water_g_label.setText(f"{g:.2f}")
+            self.water_b_label.setText(f"{b:.2f}")
+            
+            # Update shader uniforms if available
+            if hasattr(self.opengl_renderer.composite_prog, 'uniforms') and 'u_water_color' in self.opengl_renderer.composite_prog.uniforms:
+                self.opengl_renderer.composite_prog['u_water_color'].value = (r, g, b)
+            
+            self.opengl_widget.update()
 
     def update_simulation(self):
         """Update simulation"""

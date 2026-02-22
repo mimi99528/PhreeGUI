@@ -34,6 +34,13 @@ class Config:
     ENABLE_MEMORY_PROFILING = True
     ENABLE_GPU_PROFILING = True
     
+    # 深度纹理保存参数
+    ENABLE_DEPTH_TEXTURE_SAVE = True
+    DEPTH_SAVE_INTERVAL = 1.0  # 秒
+    DEPTH_SAVE_PATH = "./depth_textures"
+    DEPTH_SAVE_FORMAT = "png"  # png, npy
+    DEPTH_NORMALIZE_RANGE = True  # 是否将深度值归一化到[0,1]范围
+    
     # 边界参数
     BOUNDARY_MIN = np.array([-1.0, -1.0, -1.0], dtype=np.float64)
     BOUNDARY_MAX = np.array([1.0, 1.0, 1.0], dtype=np.float64)
@@ -69,22 +76,23 @@ class Config:
     SSFR_BLUR_SIGMA = 8.0
     SSFR_DEPTH_SIGMA = 0.025
     SSFR_BLUR_RADIUS = 4
-    SSFR_PARTICLE_RADIUS_WORLD = PARTICLE_RADIUS * 1.2
+    SSFR_PARTICLE_RADIUS_WORLD = PARTICLE_RADIUS * 1.5
     
     # 光照参数
     LIGHT_POSITION = np.array([3.5, 7.0, 3.5], dtype=np.float32)
     LIGHT_TARGET = np.array([0.0, 1.5, 0.0], dtype=np.float32)
     
-    # 材质参数
-    WATER_COLOR = (0.04, 0.28, 0.60)
-    ALPHA_BASE = 0.08
-    FRESNEL_POWER = 4.0
-    SPEC_POWER = 150.0
-    SIGMA_A = 3.5
-    SIGMA_S = 0.15
-    SHADOW_STRENGTH = 0.55
-    CAUSTIC_STRENGTH = 0.5
-    CAUSTIC_POWER = 0.6
+    # 材质参数 (已根据SSFR渲染参数面板调整)
+    alpha_liquid = 2
+    WATER_COLOR = (0.04 / alpha_liquid, 0.28 / alpha_liquid, 0.60 / alpha_liquid)
+    ALPHA_BASE = 0.05              # 基础透明度: 0.05 (原0.08)
+    FRESNEL_POWER = 4.0            # 菲涅尔幂次: 4.0 (不变)
+    SPEC_POWER = 137.0             # 镜面反射强度: 137 (原150)
+    SIGMA_A = 1.1                  # 吸收系数: 1.1 (原3.5)
+    SIGMA_S = 0.20                 # 散射系数: 0.20 (原0.15)
+    SHADOW_STRENGTH = 0.50         # 阴影强度: 0.50 (原0.55)
+    CAUSTIC_STRENGTH = 0.60        # 焦散强度: 0.60 (原0.5)
+    CAUSTIC_POWER = 0.2            # 焦散幂次: 0.2 (原0.6)
 
 # 全局配置实例
 CONFIG = Config()
