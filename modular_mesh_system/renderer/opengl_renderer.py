@@ -476,16 +476,15 @@ class OpenGLRenderer:
 
             float shad = sample_shadow(pos_ws);
 
-            vec3 fluid_body = u_water_color * ((1.0 - trans) * 0.5 + scatter);
-            fluid_body += u_water_color * 0.35 * NdotL * shad;
-
             vec3 refl_dir = reflect(-V, N_ws);
             vec3 refr_dir = refract(-V, N_ws, 1.0 / 1.333);
             vec3 env_refl = sky(refl_dir);
             vec3 env_refr = (length(refr_dir) > 0.5) ? sky(refr_dir) : sky(-V);
 
-            float fluid_opacity = clamp((1.0 - trans) * 2.0 + scatter, 0.0, 1.0);
-            vec3 refr_color = mix(env_refr, fluid_body, fluid_opacity);
+            // Beer-Lambert: transmitted environment attenuated by absorption (line below),
+            // plus in-scattered fluid body color from direct lighting (line after)
+            vec3 refr_color = trans * env_refr + (1.0 - trans) * u_water_color;
+            refr_color += u_water_color * scatter * NdotL * shad;
 
             vec3 color = mix(refr_color, env_refl, fresnel);
             color += vec3(1.0) * spec * (0.3 + 0.7 * fresnel) * shad;
@@ -911,7 +910,7 @@ class OpenGLRenderer:
         cp['u_caustic_strength'].value = CONFIG.CAUSTIC_STRENGTH
         cp['u_caustic_power'].value = CONFIG.CAUSTIC_POWER
 
-        self.depth_tex0.use(location=0)
+        final_depth_tex.use(location=0)
         self.thick_tex.use(location=1)
         self.shadow_tex.use(location=2)
         cp['u_depth'].value = 0
@@ -978,74 +977,37 @@ class OpenGLRenderer:
         src_tex = self.depth_tex0
         dst_fbo = self.depth_fbo1
 
-        # 执行5x5核的滤波迭代，间隔按指数增长
+        # 执行5次滤波，间隔按指数增长: 2, 4, 8, 16, 32
         bp['u_kernel_radius'].value = 2
-        base_interval = 1
-        for i in range(1, 6):  # 固定5次滤波
-            interval = base_interval * (2 ** i)  # 间隔指数增长: 1, 2, 4, 8, 16
+        for i in range(1, 6):
+            interval = 2 ** i
             dst_fbo.use()
             self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
             self.ctx.clear(0.0, 0.0, 0.0, 0.0)
-            
             bp['u_filter_interval'].value = interval
             src_tex.use(location=0)
             bp['u_depth'].value = 0
             self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
-            # self._save_depth_texture(src_tex)
             # 乒乓交换
             src_tex, dst_fbo = (
                 self.depth_tex1 if src_tex == self.depth_tex0 else self.depth_tex0,
                 self.depth_fbo0 if dst_fbo == self.depth_fbo1 else self.depth_fbo1
             )
-        
-        # 最终用等效64x64核大小进行一次滤波 (间隔为32)
-        bp['u_kernel_radius'].value = 2
+
+        # After 5 iterations (odd count): src_tex=depth_tex1, dst_fbo=depth_fbo0
+        # 9x9核精炼 (interval=1): reads depth_tex1 → writes depth_fbo0 (depth_tex0), no hazard
+        bp['u_kernel_radius'].value = 4
+        bp['u_filter_interval'].value = 1
         dst_fbo.use()
         self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
         self.ctx.clear(0.0, 0.0, 0.0, 0.0)
-        
-        bp['u_filter_interval'].value = 32  # 间隔32相当于64x64核
         src_tex.use(location=0)
         bp['u_depth'].value = 0
         self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
-        # self._save_depth_texture(src_tex)
-        # 乒乓交换确保最终结果在depth_tex0中
-        src_tex, dst_fbo = (
-            self.depth_tex1 if src_tex == self.depth_tex0 else self.depth_tex0,
-            self.depth_fbo0 if dst_fbo == self.depth_fbo1 else self.depth_fbo1
-        )
-        # 9x9核精炼
-        bp['u_kernel_radius'].value = 4
-        bp['u_filter_interval'].value = 1
-        
-        # 确保9x9精炼写入到depth_fbo0
-        self.depth_fbo0.use()
-        self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
-        self.ctx.clear(0.0, 0.0, 0.0, 0.0)
-        
-        # 根据当前src_tex选择正确的输入纹理
-        input_tex = src_tex  # 这是上一步的输出纹理
-        input_tex.use(location=0)
-        bp['u_depth'].value = 0
-        self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
-        # 确保最终结果在depth_tex0中
-        final_tex = self.depth_tex0
-        # self._save_depth_texture(final_tex)
-        
-        # 如果迭代次数为奇数，最终数据在depth_tex1中，需要拷贝到depth_tex0
-        if len(self.ssfr_filter_intervals) % 2 == 1:
-            # 数据在depth_tex1，需要拷贝到depth_tex0
-            self.depth_fbo0.use()
-            self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
-            self.ctx.clear(0.0, 0.0, 0.0, 0.0)
-            
-            bp['u_filter_interval'].value = 1
-            bp['u_kernel_radius'].value = 0  # 1x1核，纯拷贝
-            self.depth_tex1.use(location=0)
-            bp['u_depth'].value = 0
-            self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
-            final_tex = self.depth_tex0
 
+        # Result is in the texture attached to dst_fbo
+        # (depth_fbo0 attaches depth_tex0; depth_fbo1 attaches depth_tex1)
+        final_tex = self.depth_tex0 if dst_fbo == self.depth_fbo0 else self.depth_tex1
         return final_tex
 
     def _save_depth_texture(self, name):
