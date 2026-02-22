@@ -765,7 +765,7 @@ class OpenGLRenderer:
 
         # Original mesh rendering logic
         self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
-        self.ctx.enable(moderngl.DEPTH_TEST)
+        # self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
         self.ctx.clear(0.1, 0.1, 0.15, 1.0)
@@ -993,6 +993,7 @@ class OpenGLRenderer:
                 self.depth_tex1 if src_tex == self.depth_tex0 else self.depth_tex0,
                 self.depth_fbo0 if dst_fbo == self.depth_fbo1 else self.depth_fbo1
             )
+            # self._save_depth_texture(src_tex)
 
         # After 5 iterations (odd count): src_tex=depth_tex1, dst_fbo=depth_fbo0
         # 9x9核精炼 (interval=1): reads depth_tex1 → writes depth_fbo0 (depth_tex0), no hazard
@@ -1005,9 +1006,11 @@ class OpenGLRenderer:
         bp['u_depth'].value = 0
         self.quad_vao_bilateral.render(moderngl.TRIANGLES, vertices=6)
 
+
         # Result is in the texture attached to dst_fbo
         # (depth_fbo0 attaches depth_tex0; depth_fbo1 attaches depth_tex1)
         final_tex = self.depth_tex0 if dst_fbo == self.depth_fbo0 else self.depth_tex1
+        # self._save_depth_texture(final_tex)
         return final_tex
 
     def _save_depth_texture(self, name):

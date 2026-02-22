@@ -9,7 +9,7 @@ class Config:
     """系统配置类"""
     
     # 物理仿真参数
-    PARTICLE_RADIUS = 0.05
+    PARTICLE_RADIUS = 0.025
     MAX_PARTICLES = 30000
     H = PARTICLE_RADIUS * 2.0
     
@@ -35,15 +35,16 @@ class Config:
     ENABLE_GPU_PROFILING = True
     
     # 深度纹理保存参数
-    ENABLE_DEPTH_TEXTURE_SAVE = True
+    ENABLE_DEPTH_TEXTURE_SAVE = False
     DEPTH_SAVE_INTERVAL = 1.0  # 秒
     DEPTH_SAVE_PATH = "./depth_textures"
     DEPTH_SAVE_FORMAT = "png"  # png, npy
     DEPTH_NORMALIZE_RANGE = True  # 是否将深度值归一化到[0,1]范围
     
     # 边界参数
-    BOUNDARY_MIN = np.array([-1.0, -1.0, -1.0], dtype=np.float64)
-    BOUNDARY_MAX = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+    size_factor = 0.8
+    BOUNDARY_MIN = np.array([-1.0 * size_factor, -1.0 * size_factor, -1.0 * size_factor], dtype=np.float64)
+    BOUNDARY_MAX = np.array([1.0 * size_factor, 1.0 * size_factor, 1.0 * size_factor], dtype=np.float64)
     
     # PySPlisHSPlasH配置
     PYSPLISH_AVAILABLE = True
@@ -51,9 +52,9 @@ class Config:
     USE_SSFR = True
     
     # 时间步长配置
-    DEFAULT_TIME_STEP = 0.008
-    MIN_TIME_STEP = 0.0002
-    MAX_TIME_STEP = 0.005
+    DEFAULT_TIME_STEP = 0.016
+    MIN_TIME_STEP = 0.0004
+    MAX_TIME_STEP = 0.3
     CFL_FACTOR = 0.25
     
     # DFSPH参数
@@ -73,7 +74,7 @@ class Config:
     SSFR_SCALE = 1.0
     SSFR_FILTER_ITERATIONS = 5
     SSFR_FILTER_INTERVALS = [1, 2, 4, 8, 16]
-    SSFR_BLUR_SIGMA = 8.0
+    SSFR_BLUR_SIGMA = 10.0
     SSFR_DEPTH_SIGMA = 0.025
     SSFR_BLUR_RADIUS = 4
     SSFR_PARTICLE_RADIUS_WORLD = PARTICLE_RADIUS * 1.5
@@ -91,8 +92,8 @@ class Config:
     SIGMA_A = 1.1                  # 吸收系数: 1.1 (原3.5)
     SIGMA_S = 0.20                 # 散射系数: 0.20 (原0.15)
     SHADOW_STRENGTH = 0.50         # 阴影强度: 0.50 (原0.55)
-    CAUSTIC_STRENGTH = 0.60        # 焦散强度: 0.60 (原0.5)
-    CAUSTIC_POWER = 0.2            # 焦散幂次: 0.2 (原0.6)
+    CAUSTIC_STRENGTH = 0.8        # 焦散强度: 0.60 (原0.5)
+    CAUSTIC_POWER = 0.1            # 焦散幂次: 0.2 (原0.6)
 
 # 全局配置实例
 CONFIG = Config()
