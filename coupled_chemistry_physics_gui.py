@@ -245,8 +245,8 @@ class SimulationWorker(QObject):
         """初始化耦合仿真系统 - 异步版本"""
         try:
             if COUPLED_SIM_AVAILABLE:
-                # 创建耦合仿真实例
-                self.coupled_sim = CoupledSimulation()
+                # 创建耦合仿真实例，传入PHREEQCRM实例
+                self.coupled_sim = CoupledSimulation(phreeqc_rm=self.main_window.rm if hasattr(self.main_window, 'rm') else None)
                 # 注意：这里不立即调用initialize()，避免阻塞
                 logger.info("耦合仿真系统实例创建成功")
             else:
@@ -478,8 +478,13 @@ class CoupledSimulationMainWindow(QMainWindow):
         self.enable_ph_color_rendering = True  # 是否启用pH颜色渲染
         self.last_ph_data = None  # 缓存最后的pH数据
         
+        # PHREEQCRM配置
+        self.rm = None  # PHREEQCRM实例
+        self.chem_initialized = False
+        
         self.init_ui()
         self.setup_simulation_thread()
+        self.initialize_chemistry_system()
         
     def create_scenarios(self) -> List[ChemicalScenario]:
         """创建预定义化学反应场景"""
@@ -953,6 +958,33 @@ class CoupledSimulationMainWindow(QMainWindow):
             layout.addWidget(QLabel(f"3D渲染初始化失败: {str(e)}"))
             return panel
     
+    def initialize_chemistry_system(self):
+        """初始化化学系统"""
+        try:
+            from phreeqc_config import create_fully_initialized_phreeqcrm
+            
+            self.status_bar.showMessage("正在初始化化学系统...")
+            QApplication.processEvents()  # 更新UI
+            
+            # 创建初始化的PHREEQCRM实例
+            self.rm = create_fully_initialized_phreeqcrm(nx=6, ny=6, nz=6)
+            
+            if self.rm is not None:
+                self.chem_initialized = True
+                self.status_bar.showMessage("化学系统初始化完成")
+                logger.info("✓ PHREEQCRM化学系统初始化成功")
+            else:
+                self.chem_initialized = False
+                self.status_bar.showMessage("化学系统初始化失败")
+                logger.error("✗ PHREEQCRM化学系统初始化失败")
+                
+        except Exception as e:
+            self.chem_initialized = False
+            self.status_bar.showMessage(f"化学系统初始化错误: {str(e)}")
+            logger.error(f"化学系统初始化异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
     def setup_simulation_thread(self):
         """设置仿真线程 - 修复版"""
         self.simulation_thread = QThread()
@@ -979,7 +1011,13 @@ class CoupledSimulationMainWindow(QMainWindow):
     def on_simulation_initialized(self, success: bool):
         """处理仿真初始化完成信号"""
         if success:
-            self.status_bar.showMessage("仿真系统初始化完成 - 请选择化学反应场景")
+            status_msg = "仿真系统初始化完成"
+            if self.chem_initialized:
+                status_msg += " - 化学系统就绪"
+            else:
+                status_msg += " - 化学系统初始化失败，将使用默认模式"
+            
+            self.status_bar.showMessage(status_msg)
             # 启用开始按钮
             if hasattr(self, 'start_btn'):
                 self.start_btn.setEnabled(True)

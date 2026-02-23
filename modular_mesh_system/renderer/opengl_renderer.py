@@ -1045,7 +1045,6 @@ class OpenGLRenderer:
             # 启用混合进行颜色叠加
             self.ctx.enable(moderngl.BLEND)
             self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-            
             # 确保有颜色数据
             if self.particle_colors is not None and len(self.particle_colors) >= self.particle_count:
                 # 渲染带颜色的粒子作为可视化层
@@ -1064,7 +1063,7 @@ class OpenGLRenderer:
             
             # 重要：不清除深度测试，继续执行后续步骤
             # 但保持混合模式开启以便颜色能够显示
-            # self.ctx.disable(moderngl.BLEND)  # 注释掉这行，保持混合开启
+            self.ctx.disable(moderngl.BLEND)  # 注释掉这行，保持混合开启
 
 
         # Pass 2 - Bilateral filtering with clean ping-pong logic
