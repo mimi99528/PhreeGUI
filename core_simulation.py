@@ -22,6 +22,10 @@ from data_handling import get_ph_data, print_grid_state
 # 模拟只负责生成纯numpy数据
 max_retries = 5
 
+# 单元浓度极端值阈值：超过此值的单元将被排除出 RunCells 计算，
+# 以避免 "A(H2O) Activity of water has not converged" 收敛失败。
+MAX_VALID_CONCENTRATION = 1e10
+
 def simulate_spatial_diffusion_generator(steps=1000, data_buffer=None):
     """
     基于Generator的模拟15x15x15网格中 pH 的空间扩散过程
@@ -173,6 +177,23 @@ def simulate_spatial_diffusion_generator(steps=1000, data_buffer=None):
             if step % CHEMICAL_SYNC_INTERVAL == 0:
                 # print(f"[DEBUG] 执行化学反应同步 (步数: {step})")
                 rm.SetTime(step * TIME_STEP)
+
+                # ── 检测并排除问题单元 ──
+                # 扩散后某些单元可能出现极端浓度，导致 RunCells 中水活度
+                # 无法收敛（"A(H2O) Activity of water has not converged"）。
+                # 通过 CreateMapping 将这些单元映射为 -1，RunCells 将跳过它们。
+                current_conc = np.array(rm.GetConcentrations(), dtype=np.float64)
+                conc_2d = current_conc.reshape((ncells, ncomps))
+                cell_max = np.max(np.abs(conc_2d), axis=1)
+                problematic = cell_max > MAX_VALID_CONCENTRATION
+                if np.any(problematic):
+                    n_prob = int(np.sum(problematic))
+                    print(f"[SimThread] 排除 {n_prob}/{ncells} 个极端浓度单元")
+                    mapping = [i if not problematic[i] else -1 for i in range(ncells)]
+                    rm.CreateMapping(mapping)
+                else:
+                    rm.CreateMapping(list(range(ncells)))
+
                 retry_count = 0
                 while retry_count < max_retries:
                     try:
@@ -425,6 +446,23 @@ def simulate_spatial_diffusion(steps=1000, data_buffer=None):
             if step % CHEMICAL_SYNC_INTERVAL == 0:
                 # print(f"[DEBUG] 执行化学反应同步 (步数: {step})")
                 rm.SetTime(step * TIME_STEP)
+
+                # ── 检测并排除问题单元 ──
+                # 扩散后某些单元可能出现极端浓度，导致 RunCells 中水活度
+                # 无法收敛（"A(H2O) Activity of water has not converged"）。
+                # 通过 CreateMapping 将这些单元映射为 -1，RunCells 将跳过它们。
+                current_conc = np.array(rm.GetConcentrations(), dtype=np.float64)
+                conc_2d = current_conc.reshape((ncells, ncomps))
+                cell_max = np.max(np.abs(conc_2d), axis=1)
+                problematic = cell_max > MAX_VALID_CONCENTRATION
+                if np.any(problematic):
+                    n_prob = int(np.sum(problematic))
+                    print(f"[SimThread] 排除 {n_prob}/{ncells} 个极端浓度单元")
+                    mapping = [i if not problematic[i] else -1 for i in range(ncells)]
+                    rm.CreateMapping(mapping)
+                else:
+                    rm.CreateMapping(list(range(ncells)))
+
                 retry_count = 0
                 while retry_count < max_retries:
                     try:
@@ -468,7 +506,7 @@ def simulate_spatial_diffusion(steps=1000, data_buffer=None):
                 else:
                     print(f"[WARNING] 获取pH数据失败 (步数: {step})")
                     continue  # 跳过本次记录
-                
+                                
                 # 🔥 关键优化：使用已获取的current_data而不是再次调用RM
                 # 只打印关键统计信息，避免大量输出
                 if step % (RECORD_INTERVAL * 10) == 0:  # 每10次记录打印详细状态
@@ -482,7 +520,7 @@ def simulate_spatial_diffusion(steps=1000, data_buffer=None):
                         print(f"[INFO] Step {step} {sync_type} | Z={z_middle} 切片 | "
                               f"pH范围: [{valid_values.min():.2f}, {valid_values.max():.2f}] | "
                               f"平均: {valid_values.mean():.2f}")
-                
+                                
                 # 将计算结果发送给主线程
                 if data_buffer:
                     try:

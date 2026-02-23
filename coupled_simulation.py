@@ -168,6 +168,9 @@ class CoupledSimulation:
         self._particle_cell_ids: Optional[np.ndarray] = None
 
         self.frame_count: int = 0
+
+        # 初始平衡浓度缓存（用于空单元填充和回退）
+        self._initial_equilibrium_conc: Optional[np.ndarray] = None
         
     def _initialize_particle_chemistry(self) -> None:
         """
@@ -219,6 +222,8 @@ class CoupledSimulation:
                     if len(equilibrium_conc) == n_cells * self.n_comps:
                         # 将平衡浓度广播到所有粒子
                         cell_conc = equilibrium_conc.reshape((n_cells, self.n_comps))
+                        # 缓存初始平衡浓度，用于后续空单元填充
+                        self._initial_equilibrium_conc = cell_conc.copy()
                         self._broadcast_to_particles(cell_conc)
                         _chem_logger.info("成功使用PHREEQCRM计算初始平衡状态")
                     else:
@@ -480,6 +485,37 @@ class CoupledSimulation:
 
         n_cells = self.chem_field.n_cells
 
+        # ── 识别并排除空单元（无粒子）──
+        # _aggregate_cell_concentrations 使用 -1.0 标记空单元。
+        # 对这些单元调用 RunCells 会导致 "A(H2O) Activity of water has not
+        # converged" 错误，因为全零/极低浓度不构成有效的化学溶液。
+        # 通过 PhreeqcRM.CreateMapping 将空单元映射为 -1（非活跃），
+        # RunCells 将跳过这些单元，避免无意义的收敛尝试。
+        empty_cell_mask = np.any(cell_conc < 0, axis=1)
+        n_active = int(np.sum(~empty_cell_mask))
+
+        if n_active == 0:
+            _chem_logger.warning(
+                f"Frame {self.frame_count}: 所有化学单元均为空，跳过化学计算"
+            )
+            return cell_conc.copy()
+
+        if np.any(empty_cell_mask):
+            mapping = [i if not empty_cell_mask[i] else -1 for i in range(n_cells)]
+            try:
+                self.rm.CreateMapping(mapping)
+                _chem_logger.debug(
+                    f"Frame {self.frame_count}: 排除 {int(np.sum(empty_cell_mask))}/{n_cells} 个空单元"
+                )
+            except Exception as e:
+                _chem_logger.warning(f"Frame {self.frame_count}: CreateMapping 更新失败: {e}")
+        else:
+            # 所有单元均有粒子，恢复完整映射
+            try:
+                self.rm.CreateMapping(list(range(n_cells)))
+            except Exception as e:
+                _chem_logger.debug(f"Frame {self.frame_count}: 恢复完整映射失败: {e}")
+
         # 检查输入浓度是否有效
         if np.allclose(cell_conc, 0.0):
             _chem_logger.warning(
@@ -490,8 +526,15 @@ class CoupledSimulation:
         # 设置浓度到 PHREEQCRM（展平为 n_cells*n_comps 向量）
         conc_flat = cell_conc.flatten().copy()  # 创建副本避免修改原始数据
         
-        # 修正所有负浓度
+        # 修正空单元和负浓度：
+        # 空单元使用初始平衡浓度（若可用），否则使用背景值。
+        # 这确保 SetConcentrations 传入的数据对所有单元都是物理有效的。
         background = 1e-12
+        if self._initial_equilibrium_conc is not None and np.any(empty_cell_mask):
+            for i in np.where(empty_cell_mask)[0]:
+                start = i * self.n_comps
+                end = start + self.n_comps
+                conc_flat[start:end] = self._initial_equilibrium_conc[i]
         neg_mask = conc_flat < 0
         if np.any(neg_mask):
             conc_flat[neg_mask] = background

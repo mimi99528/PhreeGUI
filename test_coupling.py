@@ -346,7 +346,7 @@ class TestConcentrationAggregation(unittest.TestCase):
         )
 
     def test_empty_cells_contribute_zero(self):
-        """空单元对聚合结果无贡献"""
+        """空单元使用 -1.0 标记，不参与化学计算"""
         # 将所有粒子集中在域左下角
         positions = np.tile([-0.7, -0.7, -0.7], (10, 1)).astype(np.float64)
         n_comps = 1
@@ -357,10 +357,10 @@ class TestConcentrationAggregation(unittest.TestCase):
         )
         cell_conc = sim._aggregate_cell_concentrations()
 
-        # 除第 0 单元外，其余单元浓度应为 0
+        # 除第 0 单元外，其余空单元应标记为 -1.0
         for cell_id in range(1, sim.chem_field.n_cells):
             if not sim.chem_field.cell_particles[cell_id]:
-                np.testing.assert_array_equal(cell_conc[cell_id], 0.0)
+                np.testing.assert_array_equal(cell_conc[cell_id], -1.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -478,6 +478,78 @@ class TestChemicalStepControl(unittest.TestCase):
 
         # 所有粒子浓度应 >= 0
         self.assertTrue(np.all(sim._particle_solutions[:2] >= 0.0))
+
+    def test_empty_cells_excluded_via_create_mapping(self):
+        """空单元应通过 CreateMapping(-1) 从 RunCells 计算中排除"""
+        n_cells = CHEM_GRID_DIM ** 3
+        n_comps = 1
+
+        # 所有粒子集中在域的一个角落 → 绝大多数单元为空
+        positions = np.array([[-0.7, -0.7, -0.7]] * 4, dtype=np.float64)
+        conc = np.ones((4, n_comps), dtype=np.float64)
+
+        rm = _make_mock_rm(n_cells, n_comps)
+        sim = _make_coupled_sim_with_particles(
+            positions, n_comps=n_comps, initial_solutions=conc,
+            rm=rm, chem_step_ratio=1
+        )
+
+        sim.step()
+
+        # 验证 CreateMapping 被调用，且大部分单元映射为 -1
+        rm.CreateMapping.assert_called()
+        mapping = rm.CreateMapping.call_args[0][0]
+        inactive_count = sum(1 for m in mapping if m < 0)
+        self.assertGreater(inactive_count, 0, "应有空单元被排除")
+        # 至少有一个活跃单元（粒子所在单元）
+        active_count = sum(1 for m in mapping if m >= 0)
+        self.assertGreater(active_count, 0, "至少应有一个活跃单元")
+
+    def test_all_cells_active_when_all_have_particles(self):
+        """所有单元都有粒子时，CreateMapping 应恢复完整映射"""
+        n_cells = CHEM_GRID_DIM ** 3
+        n_comps = 1
+
+        # 均匀分布粒子，每个单元都有粒子
+        coords = np.linspace(-0.7, 0.7, CHEM_GRID_DIM)
+        xx, yy, zz = np.meshgrid(coords, coords, coords)
+        positions = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=1).astype(np.float64)
+        n = len(positions)
+        conc = np.ones((n, n_comps), dtype=np.float64)
+
+        rm = _make_mock_rm(n_cells, n_comps)
+        sim = _make_coupled_sim_with_particles(
+            positions, n_comps=n_comps, initial_solutions=conc,
+            rm=rm, chem_step_ratio=1
+        )
+
+        sim.step()
+
+        # 验证 CreateMapping 使用完整映射（所有单元活跃）
+        rm.CreateMapping.assert_called()
+        mapping = rm.CreateMapping.call_args[0][0]
+        for i, m in enumerate(mapping):
+            self.assertEqual(m, i, f"单元 {i} 应映射为自身")
+
+    def test_all_empty_cells_skip_chemistry(self):
+        """所有单元均为空时，应跳过化学计算"""
+        n_cells = CHEM_GRID_DIM ** 3
+        n_comps = 1
+
+        rm = _make_mock_rm(n_cells, n_comps)
+        sim = CoupledSimulation(
+            mesh_system=None,
+            phreeqc_rm=rm,
+            chem_step_ratio=1,
+        )
+        sim.n_comps = n_comps
+        sim.comp_names = ["tracer"]
+
+        # 无粒子 → 所有单元为空
+        sim.step()
+
+        # RunCells 不应被调用（所有单元为空，跳过化学计算）
+        rm.RunCells.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════
