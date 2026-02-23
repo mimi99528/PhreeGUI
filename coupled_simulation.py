@@ -513,8 +513,8 @@ class CoupledSimulation:
             # 所有单元均有粒子，恢复完整映射
             try:
                 self.rm.CreateMapping(list(range(n_cells)))
-            except Exception:
-                pass
+            except Exception as e:
+                _chem_logger.debug(f"Frame {self.frame_count}: 恢复完整映射失败: {e}")
 
         # 检查输入浓度是否有效
         if np.allclose(cell_conc, 0.0):
@@ -531,11 +531,10 @@ class CoupledSimulation:
         # 这确保 SetConcentrations 传入的数据对所有单元都是物理有效的。
         background = 1e-12
         if self._initial_equilibrium_conc is not None and np.any(empty_cell_mask):
-            for i in range(n_cells):
-                if empty_cell_mask[i]:
-                    start = i * self.n_comps
-                    end = start + self.n_comps
-                    conc_flat[start:end] = self._initial_equilibrium_conc[i]
+            for i in np.where(empty_cell_mask)[0]:
+                start = i * self.n_comps
+                end = start + self.n_comps
+                conc_flat[start:end] = self._initial_equilibrium_conc[i]
         neg_mask = conc_flat < 0
         if np.any(neg_mask):
             conc_flat[neg_mask] = background
