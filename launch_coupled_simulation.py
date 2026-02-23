@@ -14,7 +14,6 @@ def main():
     print("化学-物理耦合仿真系统启动器")
     print("=" * 60)
     print()
-    
     # 检查必要的模块
     required_modules = ['PySide6', 'numpy']
     missing_modules = []
