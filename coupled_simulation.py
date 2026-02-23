@@ -171,16 +171,17 @@ class CoupledSimulation:
         
     def _initialize_particle_chemistry(self) -> None:
         """
-        初始化粒子的化学状态，设置合理的初始浓度
+        初始化粒子的化学状态，使用PHREEQCRM计算好的溶液而不是手动设置浓度
         """
-        _chem_logger.info("开始初始化粒子化学状态")
+        _chem_logger.info("开始初始化粒子化学状态（使用PHREEQCRM计算溶液）")
         
+        # 即使没有mesh_system，我们也需要初始化化学状态用于测试
         if self.mesh_system is None:
-            _chem_logger.warning("mesh_system为None，无法初始化粒子化学状态")
-            return
-            
-        n_particles = self.mesh_system.current_particle_num
-        _chem_logger.info(f"检测到 {n_particles} 个粒子")
+            _chem_logger.info("mesh_system为None，使用默认粒子数进行初始化")
+            n_particles = 100  # 使用默认粒子数进行测试
+        else:
+            n_particles = self.mesh_system.current_particle_num
+            _chem_logger.info(f"检测到 {n_particles} 个粒子")
         
         if n_particles == 0:
             _chem_logger.warning("没有粒子，跳过化学状态初始化")
@@ -190,7 +191,7 @@ class CoupledSimulation:
         _chem_logger.info(f"当前组分信息: n_comps={self.n_comps}, comp_names={self.comp_names}")
         if self.n_comps == 0 or not self.comp_names:
             _chem_logger.warning("化学组分信息未设置，使用默认组分")
-            self.comp_names = ['H', 'O', 'Cl', 'Na']  # 使用PHREEQCRM实际检测到的组分名
+            self.comp_names = ['H+', 'OH-', 'Na+', 'Cl-']
             self.n_comps = len(self.comp_names)
             
         # 如果粒子溶液数组尚未初始化，则创建它
@@ -199,33 +200,49 @@ class CoupledSimulation:
             self._particle_solutions = np.zeros((n_particles, self.n_comps), dtype=np.float64)
             _chem_logger.info(f"创建了新的粒子溶液数组，形状: {self._particle_solutions.shape}")
         
-        # 为每个粒子设置初始化学状态
-        # 使用合理的初始浓度（mol/L）
-        # 注意：使用PHREEQCRM实际检测到的组分名称
-        initial_concentrations = {
-            'H': 1e-7,       # 氢离子
-            'O': 1e-7,       # 氢氧根离子相关
-            'Cl': 1e-2,      # 氯离子
-            'Na': 1e-2,      # 钠离子
-            'H2O': 55.5,     # 水的摩尔浓度
-            'Charge': 0.0    # 电荷平衡
-        }
-        
-        _chem_logger.info(f"开始设置初始浓度...")
-        # 将初始浓度映射到对应的组分索引
-        for i, comp_name in enumerate(self.comp_names):
-            conc = initial_concentrations.get(comp_name, 1e-6)  # 默认1e-6 mol/L
-            self._particle_solutions[:n_particles, i] = conc
-            _chem_logger.info(f"  组分 {comp_name} (索引 {i}): 设置浓度 {conc:.2e}")
+        # 使用PHREEQCRM计算初始溶液状态
+        # 这里模仿phreeGUI.py中的逻辑，让PHREEQCRM计算平衡状态
+        if self.rm is not None:
+            try:
+                _chem_logger.info("使用PHREEQCRM计算初始化学平衡状态...")
+                
+                # 设置初始时间
+                self.rm.SetTime(0.0)
+                self.rm.SetTimeStep(0.0)  # 瞬时平衡计算
+                
+                # 运行初始平衡计算
+                status = self.rm.RunCells()
+                if status == 0:
+                    # 成功计算平衡状态，获取浓度
+                    equilibrium_conc = np.array(self.rm.GetConcentrations(), dtype=np.float64)
+                    n_cells = self.chem_field.n_cells
+                    if len(equilibrium_conc) == n_cells * self.n_comps:
+                        # 将平衡浓度广播到所有粒子
+                        cell_conc = equilibrium_conc.reshape((n_cells, self.n_comps))
+                        self._broadcast_to_particles(cell_conc)
+                        _chem_logger.info("成功使用PHREEQCRM计算初始平衡状态")
+                    else:
+                        _chem_logger.warning(f"浓度数组长度不匹配: 期望{n_cells * self.n_comps}, 实际{len(equilibrium_conc)}")
+                        self._set_default_initial_concentrations(n_particles)
+                else:
+                    _chem_logger.warning(f"PHREEQCRM初始平衡计算失败 (status={status})，使用默认浓度")
+                    self._set_default_initial_concentrations(n_particles)
+                    
+            except Exception as e:
+                _chem_logger.warning(f"PHREEQCRM初始化失败: {e}，使用默认浓度")
+                self._set_default_initial_concentrations(n_particles)
+        else:
+            _chem_logger.warning("PHREEQCRM实例不可用，使用默认浓度")
+            self._set_default_initial_concentrations(n_particles)
             
         # 验证设置结果
-        min_conc = np.min(self._particle_solutions)
-        max_conc = np.max(self._particle_solutions)
-        mean_conc = np.mean(self._particle_solutions)
-        _chem_logger.info(f"浓度设置完成 - 范围: [{min_conc:.2e}, {max_conc:.2e}], 平均: {mean_conc:.2e}")
+        if self._particle_solutions is not None and n_particles > 0:
+            min_conc = np.min(self._particle_solutions[:n_particles])
+            max_conc = np.max(self._particle_solutions[:n_particles])
+            mean_conc = np.mean(self._particle_solutions[:n_particles])
+            _chem_logger.info(f"最终浓度设置完成 - 范围: [{min_conc:.2e}, {max_conc:.2e}], 平均: {mean_conc:.2e}")
         
         _chem_logger.info(f"初始化了 {n_particles} 个粒子的化学状态，组分: {self.comp_names}")
-        _chem_logger.debug(f"初始浓度设置: {[(name, initial_concentrations.get(name, 1e-6)) for name in self.comp_names]}")
 
     # ------------------------------------------------------------------
     # 初始化
@@ -417,6 +434,30 @@ class CoupledSimulation:
     # 化学反应步（PHREEQCRM）
     # ------------------------------------------------------------------
 
+    def _set_default_initial_concentrations(self, n_particles: int) -> None:
+        """
+        设置默认的初始浓度（当PHREEQCRM计算失败时的备用方案）
+        """
+        _chem_logger.info("设置默认初始浓度...")
+        
+        # 使用合理的初始浓度（mol/L）
+        initial_concentrations = {
+            'H+': 1.0e-7,      # 中性pH
+            'OH-': 1.0e-7,     # 中性pH
+            'H2O': 55.5,       # 纯水
+            'Na+': 1.0e-3,     # 微量钠离子
+            'Cl-': 1.0e-3,     # 微量氯离子
+            'HCl': 1.0e-12,    # 极微量
+            'H2': 1.0e-15,     # 极微量
+            'O2': 1.0e-15      # 极微量
+        }
+        
+        # 将初始浓度映射到对应的组分索引
+        for i, comp_name in enumerate(self.comp_names):
+            conc = initial_concentrations.get(comp_name, 1e-6)  # 默认1e-6 mol/L
+            self._particle_solutions[:n_particles, i] = conc
+            _chem_logger.debug(f"  组分 {comp_name} (索引 {i}): 设置浓度 {conc:.2e}")
+    
     def _run_chemical_step(
         self, cell_conc: np.ndarray, dt: float
     ) -> np.ndarray:
@@ -447,35 +488,42 @@ class CoupledSimulation:
             return cell_conc.copy()
 
         # 设置浓度到 PHREEQCRM（展平为 n_cells*n_comps 向量）
-        conc_flat = cell_conc.flatten()
+        conc_flat = cell_conc.flatten().copy()  # 创建副本避免修改原始数据
         
-        # 过滤掉空单元格（标记为-1的值）
-        valid_mask = conc_flat >= 0.0
-        if not valid_mask.any():
-            _chem_logger.warning(
-                f"Frame {self.frame_count}: 没有有效的浓度数据，跳过化学计算"
+        # 修正所有负浓度
+        background = 1e-12
+        neg_mask = conc_flat < 0
+        if np.any(neg_mask):
+            conc_flat[neg_mask] = background
+            
+        # 特别处理水浓度：确保不低于1e-6 mol/L
+        if self.n_comps > 0 and 'H2O' in self.comp_names:
+            h2o_index = self.comp_names.index('H2O')
+            min_h2o_conc = 1e-6
+            low_h2o_mask = conc_flat[h2o_index::self.n_comps] < min_h2o_conc
+            if low_h2o_mask.any():
+                n_low = np.sum(low_h2o_mask)
+                # 提升水浓度
+                conc_flat[h2o_index::self.n_comps][low_h2o_mask] = min_h2o_conc
+                # 清空同单元格的其他组分
+                for i in range(self.n_comps):
+                    if i != h2o_index:
+                        conc_flat[i::self.n_comps][low_h2o_mask] = 0.0
+                _chem_logger.debug(f"Frame {self.frame_count}: 提升 {n_low} 个低水浓度至 {min_h2o_conc:.1e} mol/L，并清空其他组分")
+
+        # 最终验证：确保数组长度正确且无无效值
+        expected_length = self.chem_field.n_cells * self.n_comps
+        if len(conc_flat) != expected_length:
+            _chem_logger.error(
+                f"Frame {self.frame_count}: 浓度数组长度错误！期望 {expected_length}，实际 {len(conc_flat)}"
             )
             return cell_conc.copy()
         
-        # 只处理有效浓度
-        valid_conc = conc_flat[valid_mask]
-        
-        # 验证浓度值的有效性
-        invalid_conc = np.isnan(valid_conc) | np.isinf(valid_conc)
-        if invalid_conc.any():
-            _chem_logger.warning(
-                f"Frame {self.frame_count}: 检测到无效浓度值，进行修正"
-            )
-            # 将无效值替换为小的正值
-            valid_conc[invalid_conc] = 1e-12
-        
-        # 确保浓度为正值
-        valid_conc = np.maximum(valid_conc, 1e-15)
-        
         # 调试信息
-        _chem_logger.debug(f"设置浓度到PHREEQCRM: 有效浓度数={len(valid_conc)}, min={np.min(valid_conc):.2e}, max={np.max(valid_conc):.2e}")
-        # 水的量
-        self.rm.SetConcentrations(valid_conc.tolist())
+        _chem_logger.debug(f"设置浓度到PHREEQCRM: 总浓度数={len(conc_flat)}, min={np.min(conc_flat):.2e}, max={np.max(conc_flat):.2e}")
+        
+        # 设置完整长度的浓度数组到PHREEQCRM
+        self.rm.SetConcentrations(conc_flat.tolist())
         self.rm.SetTime(self.accumulated_chem_dt)
 
         # 重试逻辑
