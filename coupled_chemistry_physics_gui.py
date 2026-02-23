@@ -255,10 +255,87 @@ class SimulationWorker(QObject):
             logger.error(f"初始化仿真系统失败: {e}")
             raise
     
+    def _setup_phreeqcrm_for_coupled_sim(self) -> None:
+        """初始化PhreeqcRM实例并注入到耦合仿真系统中。
+
+        使用与CoupledSimulation化学网格相同的单元数（chem_grid_dim^3 = 216），
+        而不是core_simulation.py里的NX*NY*NZ=3375，避免尺寸不匹配。
+        若phreeqcrm不可用则静默跳过。
+        """
+        try:
+            from phreeqcrm import PhreeqcRM
+            from utils import (
+                load_database, get_solution_definition, NTHREADS,
+                TIME_STEP, TEMPERATURE, PRESSURE, POROSITY,
+                SATURATION, REPRESENTATIVE_VOLUME, REBALANCE_FRACTION,
+            )
+        except ImportError as e:
+            logger.warning(f"PhreeqcRM不可用，化学仿真将在无化学模型模式下运行: {e}")
+            return
+
+        n_cells = self.coupled_sim.chem_field.n_cells  # 6^3 = 216
+        try:
+            rm = PhreeqcRM(n_cells, NTHREADS)
+            rm.SetComponentH2O(False)
+            rm.SetUnitsSolution(2)
+            rm.SetUnitsPPassemblage(1)
+            rm.SetUnitsExchange(1)
+            rm.SetPartitionUZSolids(False)
+            rm.SetSpeciesSaveOn(False)
+            rm.SetRebalanceFraction(REBALANCE_FRACTION)
+            rm.SetErrorOn(True)
+            rm.SetErrorHandlerMode(1)
+            rm.SetPrintChemistryOn(False, False, False)
+            rm.SetRebalanceByCell(True)
+
+            # 加载数据库
+            load_database(rm)
+
+            # 定义初始溶液并查找化学组分
+            initial_input = get_solution_definition()
+            rm.RunString(True, True, True, initial_input)
+            rm.FindComponents()
+            n_comps = rm.GetComponentCount()
+            logger.info(f"PhreeqcRM已找到 {n_comps} 个化学组分")
+
+            # 为所有单元分配背景溶液（溶液1 = pH 7 背景水）
+            for i in range(n_cells):
+                rm.InitialPhreeqcCell2Module(1, [i])
+
+            # 设置物理参数
+            rm.SetTimeStep(TIME_STEP)
+            rm.SetTemperature([TEMPERATURE] * n_cells)
+            rm.SetPressure([PRESSURE] * n_cells)
+            rm.SetPorosity([POROSITY] * n_cells)
+            rm.SetSaturationUser([SATURATION] * n_cells)
+            rm.SetRepresentativeVolume([REPRESENTATIVE_VOLUME] * n_cells)
+
+            # 创建1:1映射
+            rm.CreateMapping(list(range(n_cells)))
+
+            # 运行初始平衡
+            rm.RunCells()
+
+            # 注入到耦合仿真
+            self.coupled_sim.rm = rm
+            logger.info(
+                f"PhreeqcRM已成功初始化 ({n_cells} 个化学单元，{n_comps} 个化学组分)"
+            )
+        except Exception as e:
+            logger.error(f"PhreeqcRM初始化失败: {e}")
+
     def lazy_initialize_simulation(self):
         """延迟初始化仿真系统（在第一次仿真步骤时执行）"""
         if self.coupled_sim and not hasattr(self.coupled_sim, '_initialized'):
             try:
+                # 若未设置PhreeqcRM，先初始化化学模型
+                if self.coupled_sim.rm is None:
+                    self._setup_phreeqcrm_for_coupled_sim()
+
+                # 将mesh_system注入到耦合仿真（由coupled_sim.step()统一管理物理步）
+                if self.coupled_sim.mesh_system is None and hasattr(self.main_window, 'mesh_system'):
+                    self.coupled_sim.mesh_system = self.main_window.mesh_system
+
                 # 执行实际的初始化
                 self.coupled_sim.initialize()
                 self.coupled_sim._initialized = True
@@ -291,15 +368,8 @@ class SimulationWorker(QObject):
             if self.coupled_sim and not hasattr(self.coupled_sim, '_initialized'):
                 self.lazy_initialize_simulation()
             
-            # 执行仿真步骤
+            # 执行仿真步骤（物理+化学由coupled_sim.step()统一管理）
             if self.coupled_sim:
-                # 先执行物理仿真步骤
-                if hasattr(self.main_window, 'mesh_system'):
-                    # 直接调用物理仿真
-                    self.main_window.mesh_system.step_simulation()
-                    logger.debug(f"执行了物理仿真步骤，当前粒子数: {self.main_window.mesh_system.current_particle_num}")
-                
-                # 然后执行耦合仿真步骤
                 stats = self.coupled_sim.step()
                 
                 # 发送粒子数据更新信号

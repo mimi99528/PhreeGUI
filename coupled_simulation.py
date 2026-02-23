@@ -261,6 +261,12 @@ class CoupledSimulation:
                 self._particle_solutions = np.zeros(
                     (n, self.n_comps), dtype=np.float64
                 )
+        elif self.n_comps > 0 and self._particle_solutions is None:
+            # n_comps 在首次分配 _particle_cell_ids 之后才变为非零时，
+            # 需要补充初始化 _particle_solutions
+            self._particle_solutions = np.zeros(
+                (len(self._particle_cell_ids), self.n_comps), dtype=np.float64
+            )
 
         # 计算并存储单元 ID
         cell_ids = self._position_to_cell_id(positions)
