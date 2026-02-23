@@ -69,11 +69,12 @@ def create_robust_phreeqcrm_instance(nxyz: int = DEFAULT_NXYZ,
     try:
         # 创建实例
         rm = PhreeqcRM(nxyz, nthreads)
+
+        rm.SetComponentH2O(False)  # <-- 移到这里，最优先级
         
         # 基本配置
         rm.SetErrorOn(True)
         rm.SetErrorHandlerMode(1)  # 详细错误模式
-        rm.SetPrintChemistryOn(False, False, False)  # 减少输出
         
         # 性能优化设置
         rm.SetRebalanceByCell(True)
