@@ -194,6 +194,29 @@ def create_mapping(rm):
     rm.CreateMapping(grid2chem)
     print("   固定负载分配完成")
 
+def build_consecutive_mapping(n_cells, exclude_mask):
+    """
+    构建连续化学单元索引映射，排除指定单元。
+
+    活跃单元按顺序映射到化学单元 0, 1, 2, ...，被排除的单元映射为 -1。
+    这确保 PhreeqcRM.GetChemistryCellCount() 只反映活跃单元数量，
+    RunCells 不会处理被排除的单元。
+
+    Args:
+        n_cells (int):          网格单元总数
+        exclude_mask (iterable): 布尔数组或列表，True 表示排除该单元
+
+    Returns:
+        list[int]: 长度为 n_cells 的映射列表
+    """
+    mapping = [-1] * n_cells
+    chem_id = 0
+    for i in range(n_cells):
+        if not exclude_mask[i]:
+            mapping[i] = chem_id
+            chem_id += 1
+    return mapping
+
 def get_elapsed_time(start_time):
     """
     计算经过的时间

@@ -31,6 +31,7 @@ from coupled_simulation import (
     CHEM_MAX_RETRIES,
     DEFAULT_PARTICLE_VOLUME,
 )
+from utils import build_consecutive_mapping
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -550,6 +551,210 @@ class TestChemicalStepControl(unittest.TestCase):
 
         # RunCells 不应被调用（所有单元为空，跳过化学计算）
         rm.RunCells.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 测试套件 5b：CreateMapping 连续索引（空单元正确排除）
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestCreateMappingConsecutive(unittest.TestCase):
+    """
+    验证 CreateMapping 使用连续化学单元索引，确保空单元被正确排除。
+
+    旧的 identity 映射 [i if active else -1] 在活跃单元分散时会导致
+    大量未映射的化学单元仍被 RunCells 计算。新实现使用连续索引
+    (0, 1, 2, ...) 以减少化学单元数量。
+    """
+
+    def test_build_consecutive_mapping_basic(self):
+        """build_consecutive_mapping 应为活跃单元生成连续索引"""
+        # 8 cells, cells 0, 3, 7 active
+        exclude = [False, True, True, False, True, True, True, False]
+        mapping = build_consecutive_mapping(8, exclude)
+        self.assertEqual(mapping, [0, -1, -1, 1, -1, -1, -1, 2])
+
+    def test_build_consecutive_mapping_all_active(self):
+        """所有单元活跃时应返回 identity 映射"""
+        exclude = [False] * 5
+        mapping = build_consecutive_mapping(5, exclude)
+        self.assertEqual(mapping, [0, 1, 2, 3, 4])
+
+    def test_build_consecutive_mapping_all_excluded(self):
+        """所有单元排除时应返回全 -1"""
+        exclude = [True] * 4
+        mapping = build_consecutive_mapping(4, exclude)
+        self.assertEqual(mapping, [-1, -1, -1, -1])
+
+    def test_consecutive_mapping_indices_for_sparse_active_cells(self):
+        """活跃单元分散时，CreateMapping 应使用连续化学单元索引（0, 1, 2, ...）"""
+        n_cells = CHEM_GRID_DIM ** 3
+        n_comps = 1
+
+        # 将粒子放在域的两个对角：确保活跃单元分散
+        positions = np.array(
+            [[-0.7, -0.7, -0.7], [0.7, 0.7, 0.7]], dtype=np.float64
+        )
+        conc = np.ones((2, n_comps), dtype=np.float64)
+
+        rm = _make_mock_rm(n_cells, n_comps)
+        sim = _make_coupled_sim_with_particles(
+            positions, n_comps=n_comps, initial_solutions=conc,
+            rm=rm, chem_step_ratio=1
+        )
+
+        sim.step()
+
+        # 验证 CreateMapping 使用连续索引
+        rm.CreateMapping.assert_called()
+        mapping = rm.CreateMapping.call_args[0][0]
+
+        # 活跃单元的化学索引应从 0 开始连续递增
+        active_chem_ids = sorted([m for m in mapping if m >= 0])
+        expected_chem_ids = list(range(len(active_chem_ids)))
+        self.assertEqual(
+            active_chem_ids, expected_chem_ids,
+            f"化学单元索引应为连续的 {expected_chem_ids}，实际为 {active_chem_ids}",
+        )
+
+    def test_consecutive_mapping_reduces_chemistry_count(self):
+        """连续映射应使化学单元数量 = 活跃网格单元数量"""
+        n_cells = CHEM_GRID_DIM ** 3
+        n_comps = 1
+
+        # 只在一个角落放粒子
+        positions = np.array([[-0.7, -0.7, -0.7]] * 4, dtype=np.float64)
+        conc = np.ones((4, n_comps), dtype=np.float64)
+
+        rm = _make_mock_rm(n_cells, n_comps)
+        sim = _make_coupled_sim_with_particles(
+            positions, n_comps=n_comps, initial_solutions=conc,
+            rm=rm, chem_step_ratio=1
+        )
+
+        sim.step()
+
+        mapping = rm.CreateMapping.call_args[0][0]
+        active_chem_ids = [m for m in mapping if m >= 0]
+        n_active = len(active_chem_ids)
+        max_chem_id = max(active_chem_ids)
+
+        # 最大化学索引应恰好等于 n_active - 1（连续索引）
+        self.assertEqual(
+            max_chem_id, n_active - 1,
+            f"最大化学索引应为 {n_active - 1}（连续索引），实际为 {max_chem_id}",
+        )
+
+    def test_mapping_preserves_grid_cell_identity(self):
+        """每个活跃网格单元应映射到唯一的化学单元（无重复）"""
+        n_cells = CHEM_GRID_DIM ** 3
+        n_comps = 1
+
+        # 使用三个不同位置的粒子
+        positions = np.array(
+            [[-0.7, -0.7, -0.7], [0.0, 0.0, 0.0], [0.7, 0.7, 0.7]],
+            dtype=np.float64,
+        )
+        conc = np.ones((3, n_comps), dtype=np.float64)
+
+        rm = _make_mock_rm(n_cells, n_comps)
+        sim = _make_coupled_sim_with_particles(
+            positions, n_comps=n_comps, initial_solutions=conc,
+            rm=rm, chem_step_ratio=1
+        )
+
+        sim.step()
+
+        mapping = rm.CreateMapping.call_args[0][0]
+        active_chem_ids = [m for m in mapping if m >= 0]
+
+        # 化学单元索引应无重复
+        self.assertEqual(
+            len(active_chem_ids),
+            len(set(active_chem_ids)),
+            "化学单元索引不应有重复",
+        )
+
+    def test_full_mapping_still_identity(self):
+        """所有单元都有粒子时，映射应仍为 0, 1, 2, ..., n-1（连续 = identity）"""
+        n_cells = CHEM_GRID_DIM ** 3
+        n_comps = 1
+
+        coords = np.linspace(-0.7, 0.7, CHEM_GRID_DIM)
+        xx, yy, zz = np.meshgrid(coords, coords, coords)
+        positions = np.stack(
+            [xx.ravel(), yy.ravel(), zz.ravel()], axis=1
+        ).astype(np.float64)
+        n = len(positions)
+        conc = np.ones((n, n_comps), dtype=np.float64)
+
+        rm = _make_mock_rm(n_cells, n_comps)
+        sim = _make_coupled_sim_with_particles(
+            positions, n_comps=n_comps, initial_solutions=conc,
+            rm=rm, chem_step_ratio=1
+        )
+
+        sim.step()
+
+        mapping = rm.CreateMapping.call_args[0][0]
+        for i, m in enumerate(mapping):
+            self.assertEqual(m, i, f"完全活跃时，单元 {i} 应映射为 {i}")
+
+    def test_run_cells_called_with_valid_mapping(self):
+        """即使大部分单元为空，RunCells 仍应被调用且成功"""
+        n_cells = CHEM_GRID_DIM ** 3
+        n_comps = 2
+
+        # 只有一个角落有粒子
+        positions = np.array(
+            [[-0.7, -0.7, -0.7], [-0.6, -0.6, -0.6]], dtype=np.float64
+        )
+        conc = np.ones((2, n_comps), dtype=np.float64) * 0.01
+
+        rm = _make_mock_rm(n_cells, n_comps)
+        sim = _make_coupled_sim_with_particles(
+            positions, n_comps=n_comps, initial_solutions=conc,
+            rm=rm, chem_step_ratio=1
+        )
+
+        sim.step()
+
+        # RunCells 应被调用（至少有一个活跃单元）
+        rm.RunCells.assert_called_once()
+
+    def test_mapping_changes_between_frames(self):
+        """粒子位置变化后，映射应随之更新"""
+        n_cells = CHEM_GRID_DIM ** 3
+        n_comps = 1
+
+        # 初始位置：只在一个角落
+        positions = np.array(
+            [[-0.7, -0.7, -0.7]], dtype=np.float64
+        )
+        conc = np.ones((1, n_comps), dtype=np.float64)
+
+        rm = _make_mock_rm(n_cells, n_comps)
+        sim = _make_coupled_sim_with_particles(
+            positions, n_comps=n_comps, initial_solutions=conc,
+            rm=rm, chem_step_ratio=1
+        )
+
+        # 第一帧
+        sim.step()
+        mapping1 = rm.CreateMapping.call_args[0][0][:]
+
+        # 移动粒子到另一个位置（直接修改内部状态以模拟位置变化）
+        sim._particle_solutions[0] = [1.0]
+        sim._particle_cell_ids[0] = 0
+
+        # 第二帧
+        sim.step()
+        mapping2 = rm.CreateMapping.call_args[0][0][:]
+
+        # 两帧的映射都应有效（活跃索引连续且无间隙）
+        for mapping in [mapping1, mapping2]:
+            active_ids = sorted([m for m in mapping if m >= 0])
+            expected = list(range(len(active_ids)))
+            self.assertEqual(active_ids, expected)
 
 
 # ══════════════════════════════════════════════════════════════════════════
