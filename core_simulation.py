@@ -25,7 +25,8 @@ max_retries = 5
 
 # 单元浓度极端值阈值：超过此值的单元将被排除出 RunCells 计算，
 # 以避免 "A(H2O) Activity of water has not converged" 收敛失败。
-# 注意：水的 H/O 组分浓度天然约为 110/55 mol/L，阈值需高于此值。
+# 水的 H 组分浓度约 111 mol/L、O 约 55 mol/L，
+# 取约 4.5 倍安全系数 → 500 mol/L，远高于正常值但可检测异常积累。
 MAX_VALID_CONCENTRATION = 500.0
 
 def simulate_spatial_diffusion_generator(steps=1000, data_buffer=None):
