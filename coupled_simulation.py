@@ -540,14 +540,10 @@ class CoupledSimulation:
         initial_concentrations = {
             'H+': 1.006e-07,      # 氢离子 molality
             'OH-': 1.006e-07,     # 氢氧根离子 molality
-            'H2O': 5.551e+01,     # 水 molality
-            'H': 1.110124e+02,       # 氢原子 molality
+            'H': 1.433e-25,       # 氢原子 molality
             'H2': 7.166e-26,      # 氢气 molality
-            'O': 5.550622e+01,       # 氧原子 molality
+            'O': 0.000e+00,       # 氧原子 molality
             'O2': 0.000e+00,      # 氧气 molality
-            'Na+': 1.0e-6,        # 钠离子 molality (微量)
-            'Cl-': 1.0e-6,        # 氯离子 molality (微量)
-            'HCl': 1.0e-12        # 氯化氢 molality (极微量)
         }
         
         # 将初始浓度映射到对应的组分索引
@@ -1014,6 +1010,7 @@ class CoupledSimulation:
             history: 每帧统计信息列表
         """
         history = []
+        self.rm.SetComponentH2O(False)
         for _ in range(n_frames):
             stats = self.step()
             history.append(stats)
