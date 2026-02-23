@@ -173,6 +173,23 @@ def simulate_spatial_diffusion_generator(steps=1000, data_buffer=None):
             if step % CHEMICAL_SYNC_INTERVAL == 0:
                 # print(f"[DEBUG] 执行化学反应同步 (步数: {step})")
                 rm.SetTime(step * TIME_STEP)
+
+                # ── 检测并排除问题单元 ──
+                # 扩散后某些单元可能出现极端浓度，导致 RunCells 中水活度
+                # 无法收敛（"A(H2O) Activity of water has not converged"）。
+                # 通过 CreateMapping 将这些单元映射为 -1，RunCells 将跳过它们。
+                current_conc = np.array(rm.GetConcentrations(), dtype=np.float64)
+                conc_2d = current_conc.reshape((ncells, ncomps))
+                cell_max = np.max(np.abs(conc_2d), axis=1)
+                problematic = cell_max > 1e10
+                if np.any(problematic):
+                    n_prob = int(np.sum(problematic))
+                    print(f"[SimThread] 排除 {n_prob}/{ncells} 个极端浓度单元")
+                    mapping = [i if not problematic[i] else -1 for i in range(ncells)]
+                    rm.CreateMapping(mapping)
+                else:
+                    rm.CreateMapping(list(range(ncells)))
+
                 retry_count = 0
                 while retry_count < max_retries:
                     try:
@@ -425,6 +442,23 @@ def simulate_spatial_diffusion(steps=1000, data_buffer=None):
             if step % CHEMICAL_SYNC_INTERVAL == 0:
                 # print(f"[DEBUG] 执行化学反应同步 (步数: {step})")
                 rm.SetTime(step * TIME_STEP)
+
+                # ── 检测并排除问题单元 ──
+                # 扩散后某些单元可能出现极端浓度，导致 RunCells 中水活度
+                # 无法收敛（"A(H2O) Activity of water has not converged"）。
+                # 通过 CreateMapping 将这些单元映射为 -1，RunCells 将跳过它们。
+                current_conc = np.array(rm.GetConcentrations(), dtype=np.float64)
+                conc_2d = current_conc.reshape((ncells, ncomps))
+                cell_max = np.max(np.abs(conc_2d), axis=1)
+                problematic = cell_max > 1e10
+                if np.any(problematic):
+                    n_prob = int(np.sum(problematic))
+                    print(f"[SimThread] 排除 {n_prob}/{ncells} 个极端浓度单元")
+                    mapping = [i if not problematic[i] else -1 for i in range(ncells)]
+                    rm.CreateMapping(mapping)
+                else:
+                    rm.CreateMapping(list(range(ncells)))
+
                 retry_count = 0
                 while retry_count < max_retries:
                     try:
