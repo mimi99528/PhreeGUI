@@ -25,7 +25,9 @@ max_retries = 5
 
 # 单元浓度极端值阈值：超过此值的单元将被排除出 RunCells 计算，
 # 以避免 "A(H2O) Activity of water has not converged" 收敛失败。
-MAX_VALID_CONCENTRATION = 1e10
+# 水的 H 组分浓度约 111 mol/L、O 约 55 mol/L，
+# 取约 4.5 倍安全系数 → 500 mol/L，远高于正常值但可检测异常积累。
+MAX_VALID_CONCENTRATION = 500.0
 
 def simulate_spatial_diffusion_generator(steps=1000, data_buffer=None):
     """
@@ -183,9 +185,11 @@ def simulate_spatial_diffusion_generator(steps=1000, data_buffer=None):
                 # 扩散后某些单元可能出现极端浓度，导致 RunCells 中水活度
                 # 无法收敛（"A(H2O) Activity of water has not converged"）。
                 # 通过 CreateMapping 将这些单元映射为 -1，RunCells 将跳过它们。
+                # 注意：GetConcentrations() 返回 comp-major 布局，
+                # 即 [comp0_cell0, comp0_cell1, ..., comp1_cell0, ...]
                 current_conc = np.array(rm.GetConcentrations(), dtype=np.float64)
-                conc_2d = current_conc.reshape((ncells, ncomps))
-                cell_max = np.max(np.abs(conc_2d), axis=1)
+                conc_2d = current_conc.reshape((ncomps, ncells))
+                cell_max = np.max(np.abs(conc_2d), axis=0)
                 problematic = cell_max > MAX_VALID_CONCENTRATION
                 if np.any(problematic):
                     n_prob = int(np.sum(problematic))
@@ -213,6 +217,9 @@ def simulate_spatial_diffusion_generator(steps=1000, data_buffer=None):
                         if retry_count < max_retries:
                             rm.SetTimeStep(TIME_STEP * (0.5 ** retry_count))
                             print(f"[SimThread] Exception retry {retry_count} with smaller timestep")
+
+                # 恢复原始时间步长，避免后续步骤使用缩小后的时间步长
+                rm.SetTimeStep(TIME_STEP)
 
                 sync_type = "[化学+物理]"
                 print(f"[DEBUG] 化学反应完成")
@@ -451,9 +458,11 @@ def simulate_spatial_diffusion(steps=1000, data_buffer=None):
                 # 扩散后某些单元可能出现极端浓度，导致 RunCells 中水活度
                 # 无法收敛（"A(H2O) Activity of water has not converged"）。
                 # 通过 CreateMapping 将这些单元映射为 -1，RunCells 将跳过它们。
+                # 注意：GetConcentrations() 返回 comp-major 布局，
+                # 即 [comp0_cell0, comp0_cell1, ..., comp1_cell0, ...]
                 current_conc = np.array(rm.GetConcentrations(), dtype=np.float64)
-                conc_2d = current_conc.reshape((ncells, ncomps))
-                cell_max = np.max(np.abs(conc_2d), axis=1)
+                conc_2d = current_conc.reshape((ncomps, ncells))
+                cell_max = np.max(np.abs(conc_2d), axis=0)
                 problematic = cell_max > MAX_VALID_CONCENTRATION
                 if np.any(problematic):
                     n_prob = int(np.sum(problematic))
@@ -481,6 +490,9 @@ def simulate_spatial_diffusion(steps=1000, data_buffer=None):
                         if retry_count < max_retries:
                             rm.SetTimeStep(TIME_STEP * (0.5 ** retry_count))
                             print(f"[SimThread] Exception retry {retry_count} with smaller timestep")
+
+                # 恢复原始时间步长，避免后续步骤使用缩小后的时间步长
+                rm.SetTimeStep(TIME_STEP)
 
                 sync_type = "[化学+物理]"
                 print(f"[DEBUG] 化学反应完成")

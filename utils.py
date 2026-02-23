@@ -173,6 +173,15 @@ def get_solution_definition():
             solution_input += f"    {component} {concentration[0]} as {concentration[1]} charge\n"
         solution_input += "END\n"
     
+    # 放宽 PHREEQC 收敛容差，避免 "A(H2O) Activity of water has not converged"
+    # 默认容差约 1e-8，扩散后边界单元残差可能略高于此阈值
+    solution_input += """
+KNOBS
+    -convergence_tolerance 1e-6
+    -iterations 200
+END
+"""
+
     # 添加SELECTED_OUTPUT配置
     solution_input += """
 # 正确配置SELECTED_OUTPUT，只获取pH值
