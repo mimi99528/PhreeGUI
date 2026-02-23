@@ -189,7 +189,13 @@ def simulate_spatial_diffusion_generator(steps=1000, data_buffer=None):
                 if np.any(problematic):
                     n_prob = int(np.sum(problematic))
                     print(f"[SimThread] 排除 {n_prob}/{ncells} 个极端浓度单元")
-                    mapping = [i if not problematic[i] else -1 for i in range(ncells)]
+                    # 使用连续的化学单元索引，避免未映射单元仍被 RunCells 处理
+                    mapping = [-1] * ncells
+                    chem_id = 0
+                    for i in range(ncells):
+                        if not problematic[i]:
+                            mapping[i] = chem_id
+                            chem_id += 1
                     rm.CreateMapping(mapping)
                 else:
                     rm.CreateMapping(list(range(ncells)))
@@ -458,7 +464,13 @@ def simulate_spatial_diffusion(steps=1000, data_buffer=None):
                 if np.any(problematic):
                     n_prob = int(np.sum(problematic))
                     print(f"[SimThread] 排除 {n_prob}/{ncells} 个极端浓度单元")
-                    mapping = [i if not problematic[i] else -1 for i in range(ncells)]
+                    # 使用连续的化学单元索引，避免未映射单元仍被 RunCells 处理
+                    mapping = [-1] * ncells
+                    chem_id = 0
+                    for i in range(ncells):
+                        if not problematic[i]:
+                            mapping[i] = chem_id
+                            chem_id += 1
                     rm.CreateMapping(mapping)
                 else:
                     rm.CreateMapping(list(range(ncells)))

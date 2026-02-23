@@ -501,7 +501,15 @@ class CoupledSimulation:
             return cell_conc.copy()
 
         if np.any(empty_cell_mask):
-            mapping = [i if not empty_cell_mask[i] else -1 for i in range(n_cells)]
+            # 使用连续的化学单元索引，确保 GetChemistryCellCount 正确减少。
+            # 旧的 identity 映射 [i if active else -1] 在活跃单元分散时会导致
+            # 大量未映射的化学单元仍被 RunCells 计算，可能因陈旧数据而收敛失败。
+            mapping = [-1] * n_cells
+            chem_id = 0
+            for i in range(n_cells):
+                if not empty_cell_mask[i]:
+                    mapping[i] = chem_id
+                    chem_id += 1
             try:
                 self.rm.CreateMapping(mapping)
                 _chem_logger.debug(
