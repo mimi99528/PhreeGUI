@@ -31,6 +31,7 @@ from coupled_simulation import (
     CHEM_MAX_RETRIES,
     DEFAULT_PARTICLE_VOLUME,
 )
+from utils import build_consecutive_mapping
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -565,6 +566,25 @@ class TestCreateMappingConsecutive(unittest.TestCase):
     (0, 1, 2, ...) 以减少化学单元数量。
     """
 
+    def test_build_consecutive_mapping_basic(self):
+        """build_consecutive_mapping 应为活跃单元生成连续索引"""
+        # 8 cells, cells 0, 3, 7 active
+        exclude = [False, True, True, False, True, True, True, False]
+        mapping = build_consecutive_mapping(8, exclude)
+        self.assertEqual(mapping, [0, -1, -1, 1, -1, -1, -1, 2])
+
+    def test_build_consecutive_mapping_all_active(self):
+        """所有单元活跃时应返回 identity 映射"""
+        exclude = [False] * 5
+        mapping = build_consecutive_mapping(5, exclude)
+        self.assertEqual(mapping, [0, 1, 2, 3, 4])
+
+    def test_build_consecutive_mapping_all_excluded(self):
+        """所有单元排除时应返回全 -1"""
+        exclude = [True] * 4
+        mapping = build_consecutive_mapping(4, exclude)
+        self.assertEqual(mapping, [-1, -1, -1, -1])
+
     def test_consecutive_mapping_indices_for_sparse_active_cells(self):
         """活跃单元分散时，CreateMapping 应使用连续化学单元索引（0, 1, 2, ...）"""
         n_cells = CHEM_GRID_DIM ** 3
@@ -722,7 +742,7 @@ class TestCreateMappingConsecutive(unittest.TestCase):
         sim.step()
         mapping1 = rm.CreateMapping.call_args[0][0][:]
 
-        # 移动粒子到另一个位置
+        # 移动粒子到另一个位置（直接修改内部状态以模拟位置变化）
         sim._particle_solutions[0] = [1.0]
         sim._particle_cell_ids[0] = 0
 

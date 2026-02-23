@@ -13,7 +13,8 @@ from utils import (
     NX, NY, NZ, NXYZ, NTHREADS, TIME_STEP,
     initialize_phreeqcrm, load_database, configure_physical_parameters,
     assign_initial_solutions, get_solution_definition, create_mapping,
-    get_elapsed_time, print_simulation_header, CHEMICAL_SYNC_INTERVAL, RECORD_INTERVAL
+    get_elapsed_time, print_simulation_header, CHEMICAL_SYNC_INTERVAL, RECORD_INTERVAL,
+    build_consecutive_mapping
 )
 from physics import apply_diffusion_vectorized, apply_diffusion_vectorized_inplace
 from data_handling import get_ph_data, print_grid_state
@@ -189,14 +190,7 @@ def simulate_spatial_diffusion_generator(steps=1000, data_buffer=None):
                 if np.any(problematic):
                     n_prob = int(np.sum(problematic))
                     print(f"[SimThread] 排除 {n_prob}/{ncells} 个极端浓度单元")
-                    # 使用连续的化学单元索引，避免未映射单元仍被 RunCells 处理
-                    mapping = [-1] * ncells
-                    chem_id = 0
-                    for i in range(ncells):
-                        if not problematic[i]:
-                            mapping[i] = chem_id
-                            chem_id += 1
-                    rm.CreateMapping(mapping)
+                    rm.CreateMapping(build_consecutive_mapping(ncells, problematic))
                 else:
                     rm.CreateMapping(list(range(ncells)))
 
@@ -464,14 +458,7 @@ def simulate_spatial_diffusion(steps=1000, data_buffer=None):
                 if np.any(problematic):
                     n_prob = int(np.sum(problematic))
                     print(f"[SimThread] 排除 {n_prob}/{ncells} 个极端浓度单元")
-                    # 使用连续的化学单元索引，避免未映射单元仍被 RunCells 处理
-                    mapping = [-1] * ncells
-                    chem_id = 0
-                    for i in range(ncells):
-                        if not problematic[i]:
-                            mapping[i] = chem_id
-                            chem_id += 1
-                    rm.CreateMapping(mapping)
+                    rm.CreateMapping(build_consecutive_mapping(ncells, problematic))
                 else:
                     rm.CreateMapping(list(range(ncells)))
 
