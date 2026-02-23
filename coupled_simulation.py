@@ -425,6 +425,7 @@ class CoupledSimulation:
         Returns:
             ph_array: (n_active_particles,) float64 数组，或 None
         """
+        print(self._particle_solutions, self.n_comps)
         if self._particle_solutions is None or self.n_comps == 0:
             return None
         n = (
@@ -466,7 +467,6 @@ class CoupledSimulation:
             "chemical_step": False,
             "n_particles": 0,
         }
-
         # ── 物理步（每帧执行）──
         if self.mesh_system is not None:
             self.mesh_system.step_simulation()
@@ -500,7 +500,7 @@ class CoupledSimulation:
             # 4. 累计化学时间步
             self.accumulated_chem_dt += self.chem_dt
             self.chem_field.reaction_dt += self.chem_dt
-
+            print(self.get_particle_ph())
             stats["chemical_step"] = True
             stats["chem_time"] = self.accumulated_chem_dt
 

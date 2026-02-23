@@ -89,11 +89,15 @@ class OpenGLRenderer:
 
         # particle GPU resources
         self.particle_vbo = None
+        self.particle_color_vbo = None  # 新增：粒子颜色VBO
         self.particle_vao_depth = None
         self.particle_vao_thick = None
+        self.particle_vao_colored = None  # 新增：带颜色的粒子VAO
         self.particle_depth_prog = None
         self.particle_thick_prog = None
+        self.particle_color_prog = None  # 新增：带颜色的粒子着色器程序
         self.particle_count = 0
+        self.particle_colors = None  # 存储粒子颜色数据
 
         # ssfr passes
         self.bilateral_prog = None
@@ -268,6 +272,54 @@ class OpenGLRenderer:
             float r2 = dot(p, p);
             if (r2 > 1.0) discard;
             out_thick = 2.0 * u_particle_radius_world * sqrt(1.0 - r2);
+        }
+        '''
+
+        # Colored particle vertex shader (新增)
+        particle_color_vs = r'''
+        #version 330
+        uniform mat4 projection;
+        uniform mat4 view;
+        uniform float u_particle_radius_world;
+        uniform float u_viewport_h;
+        uniform float u_point_scale;
+        layout(location=0) in vec3 in_pos;
+        layout(location=1) in vec3 in_color;  // 新增颜色输入
+        out vec3 v_color;
+        out vec3 v_center_vs;
+        void main() {
+            vec4 view_pos = view * vec4(in_pos, 1.0);
+            v_center_vs = view_pos.xyz;
+            v_color = in_color;  // 传递颜色
+            gl_Position = projection * view_pos;
+            float z = max(-view_pos.z, 1e-4);
+            float proj_y = projection[1][1];
+            float r_px = (proj_y * u_particle_radius_world / z) * (u_viewport_h * 1.2);
+            gl_PointSize = clamp(1.5 * r_px * u_point_scale, 1.0, 512.0);
+        }
+        '''
+
+        # Colored particle fragment shader (新增)
+        particle_color_fs = r'''
+        #version 330
+        uniform mat4 projection;
+        uniform float u_particle_radius_world;
+        in vec3 v_color;
+        in vec3 v_center_vs;
+        out vec4 frag_color;
+        void main() {
+            vec2 p = gl_PointCoord * 2.0 - 1.0;
+            float r2 = dot(p, p);
+            if (r2 > 1.0) discard;
+            
+            // 计算表面深度
+            float zcap = sqrt(1.0 - r2);
+            float surf_z = v_center_vs.z + u_particle_radius_world * zcap;
+            vec4 clip = projection * vec4(v_center_vs.xy, surf_z, 1.0);
+            gl_FragDepth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
+            
+            // 使用传递的颜色
+            frag_color = vec4(v_color, 0.8);  // 固定透明度
         }
         '''
 
@@ -523,6 +575,7 @@ class OpenGLRenderer:
         # Compile programs
         self.particle_depth_prog = self.ctx.program(vertex_shader=particle_vs, fragment_shader=particle_depth_fs)
         self.particle_thick_prog = self.ctx.program(vertex_shader=particle_vs, fragment_shader=particle_thick_fs)
+        self.particle_color_prog = self.ctx.program(vertex_shader=particle_color_vs, fragment_shader=particle_color_fs)  # 新增
         self.bilateral_prog = self.ctx.program(vertex_shader=quad_vs, fragment_shader=bilateral_fs)
         self.composite_prog = self.ctx.program(vertex_shader=quad_vs, fragment_shader=comp_fs)
         self.shadow_prog = self.ctx.program(vertex_shader=shadow_vs, fragment_shader=shadow_fs)
@@ -539,9 +592,21 @@ class OpenGLRenderer:
 
         # Particle VBO / VAOs
         self.particle_vbo = self.ctx.buffer(reserve=CONFIG.MAX_PARTICLES * 3 * 4)
+        self.particle_color_vbo = self.ctx.buffer(reserve=CONFIG.MAX_PARTICLES * 3 * 4)  # 新增颜色VBO
+        
+        # 基础VAOs
         self.particle_vao_depth = self.ctx.vertex_array(self.particle_depth_prog, [(self.particle_vbo, '3f', 'in_pos')])
         self.particle_vao_thick = self.ctx.vertex_array(self.particle_thick_prog, [(self.particle_vbo, '3f', 'in_pos')])
         self.shadow_vao = self.ctx.vertex_array(self.shadow_prog, [(self.particle_vbo, '3f', 'in_pos')])
+        
+        # 带颜色的VAO（新增）
+        self.particle_vao_colored = self.ctx.vertex_array(
+            self.particle_color_prog, 
+            [
+                (self.particle_vbo, '3f', 'in_pos'),
+                (self.particle_color_vbo, '3f', 'in_color')  # 颜色属性
+            ]
+        )
 
     def update_mesh_data(self, vertices, triangles):
         """Update mesh vertex and index data - GPU优化版"""
@@ -677,43 +742,173 @@ class OpenGLRenderer:
         self.shadow_fbo = self.ctx.framebuffer(
             color_attachments=[self.shadow_tex], depth_attachment=self._shadow_depth_rb)
 
-    def update_particles(self, positions: np.ndarray):
-        """positions: shape (N,3) float32"""
+    def update_particles(self, positions: np.ndarray, ph_values: Optional[np.ndarray] = None):
+        """更新粒子位置数据 - 修复版，并可选更新pH颜色
+        
+        Args:
+            positions: shape (N,3) float32 粒子位置数组
+            ph_values: 可选的pH值数组，用于颜色可视化
+        """
         if positions is None:
             self.particle_count = 0
             return
+        
         n = int(len(positions))
         self.particle_count = n
+        
         if n == 0 or self.particle_vbo is None:
             return
 
+        # 确保数据类型和连续性
         pos = np.asarray(positions, dtype=np.float32)
         if not pos.flags['C_CONTIGUOUS']:
             pos = np.ascontiguousarray(pos)
 
-        byte_len = n * 3 * 4
+        # 计算所需字节数
+        byte_len = n * 3 * 4  # 3个float32，每个4字节
+        
+        # 如果缓冲区太小，重新创建
         if byte_len > self.particle_vbo.size:
-            self.particle_vbo.release()
-            self.particle_vbo = self.ctx.buffer(reserve=max(byte_len, CONFIG.MAX_PARTICLES * 3 * 4))
+            self._resize_particle_buffers(byte_len, n)
 
+        # 写入粒子数据
+        try:
+            self.particle_vbo.write(pos[:n].tobytes())
+            print(f"✓ 成功更新 {n} 个粒子位置到GPU")
+        except Exception as e:
+            print(f"✗ 粒子数据更新失败: {e}")
+            return
+            
+        # 如果提供了pH值，同时更新颜色
+        if ph_values is not None:
+            self.update_ph_colors(ph_values[:n])
+
+    def _resize_particle_buffers(self, byte_len: int, n: int):
+        """调整粒子缓冲区大小"""
+        # 释放旧资源
+        try:
+            self.particle_vbo.release()
+            if self.particle_color_vbo:
+                self.particle_color_vbo.release()
+        except:
+            pass
+            
+        self.particle_vbo = self.ctx.buffer(reserve=max(byte_len, CONFIG.MAX_PARTICLES * 3 * 4))
+        self.particle_color_vbo = self.ctx.buffer(reserve=max(byte_len, CONFIG.MAX_PARTICLES * 3 * 4))
+
+        # 重新创建VAOs
+        try:
             if self.particle_vao_depth:
                 self.particle_vao_depth.release()
             if self.particle_vao_thick:
                 self.particle_vao_thick.release()
             if self.shadow_vao:
                 self.shadow_vao.release()
+            if self.particle_vao_colored:
+                self.particle_vao_colored.release()
+        except:
+            pass
 
-            self.particle_vao_depth = self.ctx.vertex_array(
-                self.particle_depth_prog, [(self.particle_vbo, '3f', 'in_pos')]
-            )
-            self.particle_vao_thick = self.ctx.vertex_array(
-                self.particle_thick_prog, [(self.particle_vbo, '3f', 'in_pos')]
-            )
-            self.shadow_vao = self.ctx.vertex_array(
-                self.shadow_prog, [(self.particle_vbo, '3f', 'in_pos')]
-            )
+        self.particle_vao_depth = self.ctx.vertex_array(
+            self.particle_depth_prog, [(self.particle_vbo, '3f', 'in_pos')]
+        )
+        self.particle_vao_thick = self.ctx.vertex_array(
+            self.particle_thick_prog, [(self.particle_vbo, '3f', 'in_pos')]
+        )
+        self.shadow_vao = self.ctx.vertex_array(
+            self.shadow_prog, [(self.particle_vbo, '3f', 'in_pos')]
+        )
+        
+        # 带颜色的VAO
+        self.particle_vao_colored = self.ctx.vertex_array(
+            self.particle_color_prog,
+            [
+                (self.particle_vbo, '3f', 'in_pos'),
+                (self.particle_color_vbo, '3f', 'in_color')
+            ]
+        )
 
-        self.particle_vbo.write(pos[:n].tobytes())
+    def update_particle_colors(self, colors: np.ndarray):
+        """更新粒子颜色数据
+        
+        Args:
+            colors: shape (N,3) float32 RGB颜色数组，值范围[0,1]
+        """
+        if colors is None or self.particle_color_vbo is None:
+            return
+            
+        n = min(len(colors), self.particle_count)
+        if n == 0:
+            return
+            
+        # 确保数据类型和连续性
+        color_data = np.asarray(colors[:n], dtype=np.float32)
+        if not color_data.flags['C_CONTIGUOUS']:
+            color_data = np.ascontiguousarray(color_data)
+            
+        # 写入颜色数据
+        try:
+            self.particle_color_vbo.write(color_data.tobytes())
+            self.particle_colors = color_data.copy()  # 保存颜色数据供参考
+            print(f"✓ 成功更新 {n} 个粒子颜色到GPU")
+        except Exception as e:
+            print(f"✗ 粒子颜色更新失败: {e}")
+
+    def convert_ph_to_color(self, ph_values: np.ndarray) -> np.ndarray:
+        """将pH值转换为RGB颜色
+        
+        Args:
+            ph_values: pH值数组，通常范围0-14
+            
+        Returns:
+            colors: (N,3) RGB颜色数组，值范围[0,1]
+        """
+        if ph_values is None or len(ph_values) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+            
+        # 将pH值归一化到[0,1]范围
+        # pH 0-14 映射到 0-1
+        normalized_ph = np.clip((ph_values - 0.0) / (14.0 - 0.0), 0.0, 1.0)
+        
+        # 使用彩虹色谱：红(酸性) -> 黄 -> 绿 -> 蓝(碱性)
+        colors = np.zeros((len(normalized_ph), 3), dtype=np.float32)
+        
+        for i, ph_norm in enumerate(normalized_ph):
+            if ph_norm < 0.25:  # 红到黄
+                # 红色固定，绿色从0增加到1
+                colors[i] = [1.0, ph_norm * 4.0, 0.0]
+            elif ph_norm < 0.5:  # 黄到绿
+                # 红色从1减少到0，绿色固定
+                colors[i] = [1.0 - (ph_norm - 0.25) * 4.0, 1.0, 0.0]
+            elif ph_norm < 0.75:  # 绿到青
+                # 绿色固定，蓝色从0增加到1
+                colors[i] = [0.0, 1.0, (ph_norm - 0.5) * 4.0]
+            else:  # 青到蓝
+                # 绿色从1减少到0，蓝色固定
+                colors[i] = [0.0, 1.0 - (ph_norm - 0.75) * 4.0, 1.0]
+                
+        return colors
+        
+    def update_ph_colors(self, ph_values: np.ndarray):
+        """根据pH值更新粒子颜色
+        
+        Args:
+            ph_values: pH值数组，长度应该与粒子数量匹配
+        """
+        if ph_values is None or len(ph_values) == 0:
+            print("⚠ 无效的pH值数据")
+            return
+            
+        # 转换pH值为颜色
+        colors = self.convert_ph_to_color(ph_values)
+        
+        # 更新GPU中的颜色数据
+        self.update_particle_colors(colors)
+        
+        # 启用彩色粒子渲染
+        self.use_colored_particles = True
+        
+        print(f"✓ 已更新 {len(ph_values)} 个粒子的pH颜色 (范围: {np.min(ph_values):.2f} - {np.max(ph_values):.2f})")
 
     def _create_vertex_data(self, vertices, triangles):
         """
@@ -815,7 +1010,7 @@ class OpenGLRenderer:
     def _render_ssfr(self, width: int, height: int, screen_fbo):
         self._ensure_ssfr_targets(width, height)
         self._ensure_shadow_targets(width, height)
-
+        self.use_colored_particles  = True
         near, far = 0.1, 100.0
         projection = create_perspective_matrix(60.0, width / height, near, far)
         cam_pos = calculate_camera_position(self.camera_distance, self.camera_angle_x, self.camera_angle_y, self.camera_target)
@@ -842,6 +1037,35 @@ class OpenGLRenderer:
             p['u_viewport_h'].value = float(self._ssfr_h)
             p['u_point_scale'].value = 1.0
             self.particle_vao_depth.render(mode=moderngl.POINTS, vertices=self.particle_count)
+
+        # Pass 1.5 - Colored Particles (新增：颜色可视化层)
+        # 注意：这里不返回，继续执行完整的SSFR流程
+        color_particles_rendered = False
+        if hasattr(self, 'use_colored_particles') and self.use_colored_particles and self.particle_count > 0:
+            # 启用混合进行颜色叠加
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            
+            # 确保有颜色数据
+            if self.particle_colors is not None and len(self.particle_colors) >= self.particle_count:
+                # 渲染带颜色的粒子作为可视化层
+                p = self.particle_color_prog
+                p['projection'].write(projection.tobytes())
+                p['view'].write(view.tobytes())
+                p['u_particle_radius_world'].value = r_world
+                p['u_viewport_h'].value = float(self._ssfr_h)
+                p['u_point_scale'].value = 1.0
+                self.particle_vao_colored.render(mode=moderngl.POINTS, vertices=self.particle_count)
+
+                color_particles_rendered = True
+                print(f"✓ 渲染了 {self.particle_count} 个彩色粒子")
+            else:
+                print("⚠ 缺少粒子颜色数据，跳过彩色渲染")
+            
+            # 重要：不清除深度测试，继续执行后续步骤
+            # 但保持混合模式开启以便颜色能够显示
+            # self.ctx.disable(moderngl.BLEND)  # 注释掉这行，保持混合开启
+
 
         # Pass 2 - Bilateral filtering with clean ping-pong logic
         self.ctx.disable(moderngl.DEPTH_TEST)
