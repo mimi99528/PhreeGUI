@@ -127,31 +127,30 @@ def setup_default_chemical_system(rm: PhreeqcRM) -> bool:
     Returns:
         bool: 是否成功设置
     """
+    # 1. 必须在 FindComponents 之前设置！
+    rm.SetComponentH2O(False)
     try:
-        # 定义简化的化学系统
+        # 定义简化的化学系统（使用mol/L单位，避免水组分计算）
         input_string = """
         SOLUTION 1 
-            units mol/kgw 
+            units mol/L
             temp 25.0 
             pH 7.0
             density 1.0
-            water 1.0 kg  # 明确指定水量
         END
         
         SOLUTION 2 Simple Acidic
             pH 3.0 charge
             temp 25.0
-            units mol/kgw
+            units mol/L
             Cl 0.01 as HCl
-            water 1.0 kg  # 明确指定水量
         END
         
         SOLUTION 3 Simple Basic
             pH 11.0 charge
             temp 25.0
-            units mol/kgw
+            units mol/L
             Na 0.01 as NaOH
-            water 1.0 kg  # 明确指定水量
         END
         
         SELECTED_OUTPUT 1

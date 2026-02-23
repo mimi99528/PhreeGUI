@@ -655,15 +655,16 @@ class CoupledSimulation:
                 _chem_logger.warning(f"Frame {self.frame_count}: 检测到 {high_conc_count} 个超过1 mol/L的浓度值")
         #
         # # 处理特殊情况：H2O为0的单元
+        # # 注意：已移除可能导致H和O异常高浓度的硬编码值
         # active_inactives = [False] * len(active_cell_indices)  # 只标记活跃单元中的inactive
         # if self.n_comps > 0 and len(conc_flat_active) > 0:
-        #     # 预计算的初始浓度（mol/kgw）
+        #     # 使用合理的默认浓度（mol/L）
         #     initial_concentrations = {
         #         'OH-': 1.006e-07,
         #         'H+': 1.006e-07,
-        #         'H': 1.110124e+02,
-        #         'O': 5.551e+01,
-        #         'H2O': 5.551e+01,
+        #         'H': 1.433e-25,      # 极低的氢原子浓度
+        #         'O': 0.000e+00,      # 零氧原子浓度
+        #         'H2O': 1.000e-06,    # 极低的水浓度
         #         'H2': 7.166e-26,
         #         'O2': 0.000e+00,
         #         'Charge': 0.000e+00
