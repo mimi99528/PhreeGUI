@@ -284,7 +284,23 @@ class OpenGLRenderer:
         out float frag_out;
         void main() {
             float center = texture(u_depth, v_uv).r;
-            if (center < 1e-4) { frag_out = 0.0; return; }
+            if (center < 1e-4) { 
+                // 尝试从邻居填充，避免空洞
+                float nearest = 0.0;
+                float nearest_dist = 1e10;
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        vec2 uv = v_uv + vec2(float(dx), float(dy)) * u_texel;
+                        float d = texture(u_depth, uv).r;
+                        if (d > 1e-4 && length(vec2(dx,dy)) < nearest_dist) {
+                            nearest = d;
+                            nearest_dist = length(vec2(dx,dy));
+                        }
+                    }
+                }
+                frag_out = nearest;
+                return; 
+            }
 
             float sum = 0.0;
             float wsum = 0.0;
@@ -978,9 +994,8 @@ class OpenGLRenderer:
         dst_fbo = self.depth_fbo1
 
         # 执行5次滤波，间隔按指数增长: 2, 4, 8, 16, 32
-        bp['u_kernel_radius'].value = 2
-        for i in range(1, 6):
-            interval = 2 ** i
+        for index, interval in enumerate(self.ssfr_filter_intervals):
+            bp['u_kernel_radius'].value = 3 + 2 * index
             dst_fbo.use()
             self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
             self.ctx.clear(0.0, 0.0, 0.0, 0.0)

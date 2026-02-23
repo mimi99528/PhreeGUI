@@ -9,7 +9,7 @@ class Config:
     """系统配置类"""
     
     # 物理仿真参数
-    PARTICLE_RADIUS = 0.025
+    PARTICLE_RADIUS = 0.05
     MAX_PARTICLES = 30000
     H = PARTICLE_RADIUS * 2.0
     
@@ -72,10 +72,10 @@ class Config:
     
     # SSFR渲染参数
     SSFR_SCALE = 1.0
-    SSFR_FILTER_ITERATIONS = 5
-    SSFR_FILTER_INTERVALS = [1, 2, 4, 8, 16]
-    SSFR_BLUR_SIGMA = 10.0
-    SSFR_DEPTH_SIGMA = 0.025
+    SSFR_FILTER_ITERATIONS = 6  # 增加迭代次数
+    SSFR_FILTER_INTERVALS = [1, 1, 2, 2, 4, 4]  # 小步长优先，密集采样
+    SSFR_BLUR_SIGMA = 2.0
+    SSFR_DEPTH_SIGMA = 0.015
     SSFR_BLUR_RADIUS = 4
     SSFR_PARTICLE_RADIUS_WORLD = PARTICLE_RADIUS * 1.5
     
