@@ -1303,6 +1303,7 @@ class CoupledSimulationMainWindow(QMainWindow):
                                     end_pid = mesh_system.current_particle_num + 8
                                                         
                                     # 根据粒子类型设置不同的初始化学成分
+                                    print(fluid_type)
                                     if fluid_type == 1:  # 中性水
                                         self._initialize_neutral_water_chemistry(start_pid, end_pid)
                                     elif fluid_type == 2:  # 酸性溶液
@@ -1467,7 +1468,7 @@ class CoupledSimulationMainWindow(QMainWindow):
             QApplication.processEvents()  # 更新UI
             
             # 创建初始化的PHREEQCRM实例
-            self.rm = create_fully_initialized_phreeqcrm(nx=6, ny=6, nz=6)
+            self.rm = create_fully_initialized_phreeqcrm(nx=10, ny=10, nz=10)
             
             if self.rm is not None:
                 self.chem_initialized = True

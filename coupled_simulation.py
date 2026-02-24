@@ -31,7 +31,7 @@ if not _chem_logger.handlers:
     _chem_logger.addHandler(_fh)
 
 # ==================== 默认配置 ====================
-CHEM_GRID_DIM: int = 6          # 化学单元网格边长（6×6×6=216）
+CHEM_GRID_DIM: int = 10          # 化学单元网格边长（6×6×6=216）
 CHEM_STEP_RATIO: int = 3        # 每 N 帧物理步执行一次化学步
 CHEM_MAX_RETRIES: int = 3       # PHREEQCRM.RunCells() 失败时最大重试次数
 DEFAULT_PARTICLE_RADIUS: float = 0.05          # 来自 Config.PARTICLE_RADIUS
@@ -603,6 +603,7 @@ class CoupledSimulation:
                 c += 1
         
         try:
+            print(swig_mapping)
             self.rm.CreateMappingSWIG(swig_mapping)
         except Exception as e:
             _chem_logger.warning(f"Frame {self.frame_count}: CreateMappingSWIG 失败: {e}")

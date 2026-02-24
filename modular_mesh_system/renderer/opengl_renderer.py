@@ -955,18 +955,34 @@ class OpenGLRenderer:
         colors = np.zeros((len(normalized_ph), 3), dtype=np.float32)
         
         for i, ph_norm in enumerate(normalized_ph):
-            if ph_norm < 0.25:  # 红到黄
-                # 红色固定，绿色从0增加到1
-                colors[i] = [1.0, ph_norm * 4.0, 0.0]
-            elif ph_norm < 0.5:  # 黄到绿
-                # 红色从1减少到0，绿色固定
-                colors[i] = [1.0 - (ph_norm - 0.25) * 4.0, 1.0, 0.0]
-            elif ph_norm < 0.75:  # 绿到青
-                # 绿色固定，蓝色从0增加到1
-                colors[i] = [0.0, 1.0, (ph_norm - 0.5) * 4.0]
-            else:  # 青到蓝
-                # 绿色从1减少到0，蓝色固定
-                colors[i] = [0.0, 1.0 - (ph_norm - 0.75) * 4.0, 1.0]
+            if ph_norm < 0.214:  # 强酸性 (pH 1-3): 深红到橙红
+                # 深红色到橙红色渐变
+                t = ph_norm / 0.214
+                colors[i] = [1.0, t * 0.4, 0.0]  # 从深红(1,0,0)到橙红(1,0.4,0)
+            elif ph_norm < 0.429:  # 中酸性 (pH 4-6): 橙色到黄绿色
+                # 橙色到黄色再到黄绿色
+                t = (ph_norm - 0.214) / (0.429 - 0.214)
+                if t < 0.5:  # 橙色到黄色
+                    colors[i] = [1.0, 0.4 + t * 0.6, 0.0]
+                else:  # 黄色到黄绿色
+                    t2 = (t - 0.5) * 2.0
+                    colors[i] = [1.0 - t2 * 0.3, 1.0, t2 * 0.3]
+            elif ph_norm < 0.5:  # 中性 (pH 7): 绿色
+                # 绿色或浅黄绿色
+                t = (ph_norm - 0.429) / (0.5 - 0.429)
+                colors[i] = [0.7 + t * 0.3, 1.0, 0.3 + t * 0.4]
+            elif ph_norm < 0.643:  # 弱碱性 (pH 8-9): 蓝绿色到浅蓝色
+                # 蓝绿色到浅蓝色
+                t = (ph_norm - 0.5) / (0.643 - 0.5)
+                colors[i] = [0.0, 1.0 - t * 0.3, 0.7 + t * 0.3]
+            elif ph_norm < 0.857:  # 中碱性 (pH 10-11): 深蓝色
+                # 深蓝色渐变
+                t = (ph_norm - 0.643) / (0.857 - 0.643)
+                colors[i] = [0.0, 0.3 + t * 0.4, 1.0]
+            else:  # 强碱性 (pH 12-14): 紫色到蓝紫色
+                # 紫色到蓝紫色
+                t = (ph_norm - 0.857) / (1.0 - 0.857)
+                colors[i] = [t * 0.6, 0.0, 1.0]
                 
         return colors
         
