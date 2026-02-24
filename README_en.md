@@ -61,7 +61,6 @@ This project is licensed under the **GNU General Public License v3.0** — see t
 
 - **Author**: mimi
 - **Email**: [mimi99258@outlook.com](mailto:mimi99258@outlook.com)
-- **Project Link**: [https://github.com/yourname/PhreeGUI](https://github.com/yourname/PhreeGUI)
 
 ---
 *Made with ❤️ and 🤖 by mimi*
