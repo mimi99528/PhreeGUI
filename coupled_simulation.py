@@ -32,7 +32,7 @@ if not _chem_logger.handlers:
 
 # ==================== 默认配置 ====================
 CHEM_GRID_DIM: int = 6          # 化学单元网格边长（6×6×6=216）
-CHEM_STEP_RATIO: int = 1        # 每 N 帧物理步执行一次化学步
+CHEM_STEP_RATIO: int = 3        # 每 N 帧物理步执行一次化学步
 CHEM_MAX_RETRIES: int = 3       # PHREEQCRM.RunCells() 失败时最大重试次数
 DEFAULT_PARTICLE_RADIUS: float = 0.05          # 来自 Config.PARTICLE_RADIUS
 DEFAULT_PARTICLE_VOLUME: float = (4.0 / 3.0) * np.pi * DEFAULT_PARTICLE_RADIUS ** 3

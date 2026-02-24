@@ -7,6 +7,7 @@ import numpy as np
 import threading
 from typing import Dict, List, Optional, Tuple
 
+
 # PySPlisHSPlasH integration
 try:
     import pysplishsplash as sph
@@ -276,11 +277,20 @@ class MeshSystem:
             self.scene.materials.append(material)
             print(f"✓ Material added with maxEmitterParticles={CONFIG.MAX_EMITTER_PARTICLES}")
 
+            # self.scene.fluidBlocks.append(
+            #     sph.Utilities.SceneLoaderStructs.FluidBlock(
+            #         id='Fluid',
+            #         boxMin=[-0.5, 0, -0.5],
+            #         boxMax=[0.5, 6, 0.5],
+            #         mode=0,
+            #         initialVelocity=[0.0, 0.0, 0.0]
+            #     )
+            # )
             self.scene.fluidBlocks.append(
                 sph.Utilities.SceneLoaderStructs.FluidBlock(
                     id='Fluid',
-                    boxMin=[-0.5, 0, -0.5],
-                    boxMax=[0.5, 6, 0.5],
+                    boxMin=[-0, 0, -0],
+                    boxMax=[0, 0, 0],
                     mode=0,
                     initialVelocity=[0.0, 0.0, 0.0]
                 )
@@ -568,18 +578,20 @@ class MeshSystem:
         return self.current_particle_num
 
     def add_particles(self, positions: np.ndarray, fluid_type: int = 1):
-        """添加新的粒子到系统中 - 使用PySPlisHSPlasH官方FluidModel API直接注入粒子
-        
-        正确方式：通过 FluidModel.setPosition / setVelocity / setNumActiveParticles
-        直接在已初始化的仿真中激活预分配的粒子槽位（需在场景初始化时配置
-        MaterialData.maxEmitterParticles 以预留足够空间）。
-        
-        注意：scene.emitters.append() 仅在 initSimulation() 调用前有效，
-        运行时无法通过该方式动态添加粒子。
+        """添加新粒子 - 终极修复版
 
-        Args:
-            positions: 粒子位置数组，shape (N, 3)
-            fluid_type: 液体类型 1=水, 2=酸性溶液, 3=碱性溶液
+        由于 CompactNSearch::NeighborhoodSearch 未在 pybind11 中绑定，
+        resize_point_set 不可从 Python 直接调用。
+
+        绕过方案：
+        1. 将当前所有粒子的物理状态存入 position0/velocity0（作为"快照"）
+        2. 将新粒子同样写入 position0/velocity0
+        3. 调用 fm.reset()：内部会触发 resize_point_set + 从 position0 恢复
+        4. 执行邻域搜索
+
+        这个方案的代价：reset() 会清零 acceleration，重置 density，
+        但 position 和 velocity 会从 position0/velocity0 完整恢复，
+        物理仿真连续性基本不受影响（损失当前帧的 acceleration，可接受）。
         """
         if positions is None or len(positions) == 0:
             return
@@ -590,6 +602,7 @@ class MeshSystem:
 
         if self.pysplish_fluid_model is not None:
             try:
+                import pysplishsplash as sph
                 fm = self.pysplish_fluid_model
                 current_active = int(fm.numActiveParticles())
                 max_particles = int(fm.numParticles())
@@ -601,27 +614,46 @@ class MeshSystem:
 
                 n_to_add = min(n_new, available)
                 positions_to_add = np.asarray(positions[:n_to_add], dtype=np.float64)
+                new_active = current_active + n_to_add
 
-                # 1. 写入粒子位置和速度
+                # === 步骤 1：将当前所有老粒子的运动状态快照写入 position0/velocity0 ===
+                # 这样 reset() 恢复时不会丢失当前物理状态
+                pos_buf = np.asarray(fm.getFieldBuffer("position"))  # shape (numParticles, 3)
+                vel_buf = np.asarray(fm.getFieldBuffer("velocity"))  # shape (numParticles, 3)
+
+                for i in range(current_active):
+                    fm.setPosition0(i, pos_buf[i].tolist())
+                    fm.setVelocity0(i, vel_buf[i].tolist())
+
+                # === 步骤 2：写入新粒子数据（position, position0, velocity, velocity0） ===
                 for i in range(n_to_add):
                     idx = current_active + i
-                    fm.setPosition(idx, positions_to_add[i].tolist())
+                    p = positions_to_add[i].tolist()
+                    fm.setPosition(idx, p)
+                    fm.setPosition0(idx, p)
                     fm.setVelocity(idx, [0.0, 0.0, 0.0])
+                    fm.setVelocity0(idx, [0.0, 0.0, 0.0])
 
-                # 2. 更新活跃粒子计数
-                fm.setNumActiveParticles(current_active + n_to_add)
+                # === 步骤 3：更新 numActiveParticles0（reset() 会从这里读取目标数量） ===
+                fm.setNumActiveParticles0(new_active)
 
-                # 3. 关键补丁 A：初始化解算器缓冲区（j 从 current_active 开始）
-                # 注意：第二个参数必须是新粒子开始的索引！
+                # === 步骤 4：调用 fm.reset() ===
+                # 内部执行：
+                #   setNumActiveParticles(numActiveParticles0)  ← = new_active ✓
+                #   for i in 0..numParticles: pos[i] = pos0[i], vel[i] = vel0[i]  ← 已快照 ✓
+                #   neighborhoodSearch->resize_point_set(pointSetIndex, &pos[0], new_active)  ← 核心！✓
+                #   emitterSystem->reset()  ← emitter 计数器重置，无害
+                fm.reset()
+
+                # === 步骤 5：通知 solver 缓冲区（在 reset 之后） ===
+                # reset 之后 numActiveParticles = new_active，emittedParticles 从 current_active 开始
                 self.pysplish_simulation.emittedParticles(fm, current_active)
 
-                print(f"Adding {n_to_add} particles. New total: {current_active + n_to_add}, Capacity: {fm.numParticles()}")
-                # 5. 执行邻域搜索
+                # === 步骤 6：执行邻域搜索 ===
                 self.pysplish_simulation.performNeighborhoodSearch()
 
-                # 同步PySPlisHSPlasH数据到本地缓冲区
+                print(f"Adding {n_to_add} particles. New total: {new_active}, Capacity: {max_particles}")
                 self.sync_particle_data()
-
                 print(f"✓ 成功添加 {n_to_add}/{n_new} 个粒子，总活跃粒子数: {fm.numActiveParticles()}")
                 return
 
@@ -630,14 +662,12 @@ class MeshSystem:
                 import traceback
                 traceback.print_exc()
 
-        # PySPlisHSPlasH不可用时的回退：仅添加到本地缓冲区
-        # 注意：此模式下粒子不参与物理仿真
+        # 回退
         available_space = CONFIG.MAX_PARTICLES - self.current_particle_num
         n_to_add = min(n_new, available_space)
         if n_to_add <= 0:
             print(f"⚠ 本地系统空间不足")
             return
-
         start_idx = self.current_particle_num
         end_idx = start_idx + n_to_add
         self.particle_positions[start_idx:end_idx] = positions[:n_to_add]
@@ -646,7 +676,6 @@ class MeshSystem:
         self.particle_materials[start_idx:end_idx] = 0
         self.current_particle_num = end_idx
         print(f"⚠ 回退到本地系统（无物理仿真）: 添加 {n_to_add} 个粒子，总数: {self.current_particle_num}")
-    
     def get_particle_colors_by_type(self) -> np.ndarray:
         """根据粒子类型获取颜色
         

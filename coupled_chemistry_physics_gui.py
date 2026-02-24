@@ -1294,7 +1294,30 @@ class CoupledSimulationMainWindow(QMainWindow):
                             offset = np.random.normal(0, 0.03, 3)  # 标准差0.03的正态分布
                             pos = position + offset
                             particle_positions.append(pos)
-                        
+                            # 添加化学系统（粒子的成分）
+                            # 根据粒子类型设置不同的初始化学成分
+                            if self.parent() is not None:
+                                try:
+                                    # 获取新增粒子的起始索引
+                                    start_pid = mesh_system.current_particle_num
+                                    end_pid = mesh_system.current_particle_num + 8
+                                                        
+                                    # 根据粒子类型设置不同的初始化学成分
+                                    if fluid_type == 1:  # 中性水
+                                        self._initialize_neutral_water_chemistry(start_pid, end_pid)
+                                    elif fluid_type == 2:  # 酸性溶液
+                                        self._initialize_acidic_chemistry(start_pid, end_pid)
+                                    elif fluid_type == 3:  # 碱性溶液
+                                        self._initialize_alkaline_chemistry(start_pid, end_pid)
+                                                        
+                                    print(f"✓ 为新增粒子设置了类型{fluid_type}的化学成分")
+                                except Exception as e:
+                                    print(f"✗ 设置新增粒子化学成分失败: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                            else:
+                                print("⚠ 化学耦合系统未初始化，跳过化学成分设置")
+                            
                         # 转换为numpy数组
                         positions_array = np.array(particle_positions, dtype=np.float32)
                         print(f"网格系统: {mesh_system}")
@@ -1322,7 +1345,107 @@ class CoupledSimulationMainWindow(QMainWindow):
                         print(f"✗ 添加粒子失败: {e}")
                         import traceback
                         traceback.print_exc()
-            
+
+                def _initialize_neutral_water_chemistry(self, start_pid: int, end_pid: int):
+                    """
+                    初始化中性水粒子的化学成分
+
+                    Args:
+                        start_pid: 起始粒子ID
+                        end_pid: 结束粒子ID（不包含）
+                    """
+                    if self.parent() is None or self.parent().parent().parent().parent().simulation_worker.coupled_sim._particle_solutions is None:
+                        print("⚠ 化学系统未就绪，无法初始化中性水成分")
+                        return
+
+                    # 中性水的典型化学成分（mol/kg）
+                    # 参考PHREEQCRM的水化学平衡结果
+                    neutral_composition = {
+                        'H+': 1.006e-07,  # pH=7时的氢离子浓度
+                        'OH-': 1.006e-07,  # pH=7时的氢氧根离子浓度
+                        'H': 110.68,  # 水中的氢原子（mol/kg）
+                        'O': 55.35,  # 水中的氧原子（mol/kg）
+                        'Charge': 0.0,  # 电荷平衡
+                        'Na+': 1e-6,  # 微量钠离子
+                        'Cl-': 1e-6,  # 微量氯离子
+                    }
+
+                    # 为每个新增粒子设置中性水成分
+                    for pid in range(start_pid, end_pid):
+                        for comp_idx, comp_name in enumerate(self.parent().parent().parent().parent().simulation_worker.coupled_sim.comp_names):
+                            conc = neutral_composition.get(comp_name, 1e-6)  # 默认微量浓度
+                            if pid < len(self.parent().parent().parent().parent().simulation_worker.coupled_sim._particle_solutions):
+                                self.parent().parent().parent().parent().simulation_worker.coupled_sim._particle_solutions[pid, comp_idx] = conc
+
+                    print(f"  已为粒子[{start_pid}:{end_pid}]设置中性水化学成分")
+                    print(f"  pH ≈ 7.0, 主要组分: H={neutral_composition['H']:.2f}, O={neutral_composition['O']:.2f}")
+
+                def _initialize_acidic_chemistry(self, start_pid: int, end_pid: int):
+                    """
+                    初始化酸性溶液粒子的化学成分
+
+                    Args:
+                        start_pid: 起始粒子ID
+                        end_pid: 结束粒子ID（不包含）
+                    """
+                    if self.parent() is None or self.parent().parent().parent().parent().simulation_worker.coupled_sim._particle_solutions is None:
+                        print("⚠ 化学系统未就绪，无法初始化酸性成分")
+                        return
+
+                    # 酸性溶液的化学成分（模拟pH=3的HCl溶液）
+                    acidic_composition = {
+                        'H+': 1.0e-03,  # pH=3时的高氢离子浓度
+                        'OH-': 1.0e-11,  # 对应的极低氢氧根浓度
+                        'H': 110.68,  # 水中的氢原子
+                        'O': 55.35,  # 水中的氧原子
+                        'Charge': 0.0,  # 电荷平衡
+                        'Cl-': 1.0e-03,  # 氯离子（与H+平衡）
+                        'Na+': 1e-6,  # 微量钠离子
+                    }
+
+                    # 为每个新增粒子设置酸性成分
+                    for pid in range(start_pid, end_pid):
+                        for comp_idx, comp_name in enumerate(self.parent().parent().parent().parent().simulation_worker.coupled_sim.comp_names):
+                            conc = acidic_composition.get(comp_name, 1e-6)
+                            if pid < len(self.parent().parent().parent().parent().simulation_worker.coupled_sim._particle_solutions):
+                                self.parent().parent().parent().parent().simulation_worker.coupled_sim._particle_solutions[pid, comp_idx] = conc
+
+                    print(f"  已为粒子[{start_pid}:{end_pid}]设置酸性化学成分")
+                    print(f"  pH ≈ 3.0, H+={acidic_composition['H+']:.2e}, Cl-={acidic_composition['Cl-']:.2e}")
+
+                def _initialize_alkaline_chemistry(self, start_pid: int, end_pid: int):
+                    """
+                    初始化碱性溶液粒子的化学成分
+
+                    Args:
+                        start_pid: 起始粒子ID
+                        end_pid: 结束粒子ID（不包含）
+                    """
+                    if self.parent() is None or self.parent().parent().parent().parent().simulation_worker.coupled_sim._particle_solutions is None:
+                        print("⚠ 化学系统未就绪，无法初始化碱性成分")
+                        return
+
+                    # 碱性溶液的化学成分（模拟pH=11的NaOH溶液）
+                    alkaline_composition = {
+                        'H+': 1.0e-11,  # pH=11时的极低氢离子浓度
+                        'OH-': 1.0e-03,  # 高氢氧根浓度
+                        'H': 110.68,  # 水中的氢原子
+                        'O': 55.35,  # 水中的氧原子
+                        'Charge': 0.0,  # 电荷平衡
+                        'Na+': 1.0e-03,  # 钠离子（与OH-平衡）
+                        'Cl-': 1e-6,  # 微量氯离子
+                    }
+
+                    # 为每个新增粒子设置碱性成分
+                    for pid in range(start_pid, end_pid):
+                        for comp_idx, comp_name in enumerate(self.parent().parent().parent().parent().simulation_worker.coupled_sim.comp_names):
+                            conc = alkaline_composition.get(comp_name, 1e-6)
+                            if pid < len(self.parent().parent().parent().parent().simulation_worker.coupled_sim._particle_solutions):
+                                self.parent().parent().parent().parent().simulation_worker.coupled_sim.self.parent().parent().parent().parent().simulation_worker.coupled_sim._particle_solutions[pid, comp_idx] = conc
+
+                    print(f"  已为粒子[{start_pid}:{end_pid}]设置碱性化学成分")
+                    print(f"  pH ≈ 11.0, OH-={alkaline_composition['OH-']:.2e}, Na+={alkaline_composition['Na+']:.2e}")
+
             self.opengl_widget = QOpenGLWrapper(self.opengl_renderer, self.mesh_system)
             layout.addWidget(self.opengl_widget)
             
@@ -1517,7 +1640,7 @@ class CoupledSimulationMainWindow(QMainWindow):
         self.concentration_viz.update_concentration_data(np.array([]))
         
         self.status_bar.showMessage("仿真已重置")
-    
+
     def reset_camera_view(self):
         """重置摄像机视图到默认位置"""
         if hasattr(self, 'opengl_renderer'):
