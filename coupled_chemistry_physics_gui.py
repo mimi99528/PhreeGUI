@@ -276,7 +276,7 @@ class SimulationWorker(QObject):
         n_cells = self.coupled_sim.chem_field.n_cells  # 6^3 = 216
         try:
             rm = PhreeqcRM(n_cells, NTHREADS)
-            # rm.SetComponentH2O(False)
+            rm.SetComponentH2O(False)
             rm.SetUnitsSolution(2)
             rm.SetUnitsPPassemblage(1)
             rm.SetUnitsExchange(1)

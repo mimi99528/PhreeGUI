@@ -633,7 +633,7 @@ class CoupledSimulation:
         
         # 提取活跃单元的浓度数据
         active_cell_conc = cell_conc[significant_cells_mask]  # (n_active, n_comps)
-        conc_flat_active = active_cell_conc.flatten().copy()  # 展平为 (n_active * n_comps,)
+        conc_flat_active = active_cell_conc.T.flatten().copy()
         print("conc_flat_active:", conc_flat_active)
         _chem_logger.debug(f"Frame {self.frame_count}: 活跃单元浓度列表长度: {len(conc_flat_active)}, 活跃单元数: {n_significant}")
         
