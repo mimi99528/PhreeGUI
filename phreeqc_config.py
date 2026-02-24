@@ -204,10 +204,12 @@ def initialize_grid_distribution(rm: PhreeqcRM, nx: int = DEFAULT_NX,
             x_idx = remaining % nx
             
             # 空间分布策略
-            if x_idx < nx//3 and y_idx < ny//3 and z_idx < nz//3:
+            if x_idx <= nx//2 and y_idx <= ny//2 and z_idx < nz/2:
+                print(x_idx, y_idx, z_idx, " acid")
                 # 左上角区域 - 酸性
                 rm.InitialPhreeqcCell2Module(2, [i])
-            elif x_idx > 2*nx//3 and y_idx > 2*ny//3 and z_idx > 2*nz//3:
+            elif x_idx > nx//2 and y_idx > ny//2 and z_idx >= nz//2:
+                print(x_idx, y_idx, z_idx, " basic")
                 # 右下角区域 - 碱性
                 rm.InitialPhreeqcCell2Module(3, [i])
             else:

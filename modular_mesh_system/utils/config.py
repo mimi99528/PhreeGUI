@@ -52,8 +52,8 @@ class Config:
     USE_SSFR = True
     
     # 时间步长配置
-    DEFAULT_TIME_STEP = 0.016
-    MIN_TIME_STEP = 0.0004
+    DEFAULT_TIME_STEP = 0.1
+    MIN_TIME_STEP = 0.02
     MAX_TIME_STEP = 0.3
     CFL_FACTOR = 0.25
     

@@ -268,8 +268,8 @@ class MeshSystem:
             self.scene.fluidBlocks.append(
                 sph.Utilities.SceneLoaderStructs.FluidBlock(
                     id='Fluid',
-                    boxMin=[-1.0, 0.3, -1.0],
-                    boxMax=[1.0, 3.2, 1.0],
+                    boxMin=[-0.5, 0, -0.5],
+                    boxMax=[0.5, 6, 0.5],
                     mode=0,
                     initialVelocity=[0.0, 0.0, 0.0]
                 )
