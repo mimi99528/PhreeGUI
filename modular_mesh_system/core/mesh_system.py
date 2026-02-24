@@ -56,6 +56,7 @@ class MeshSystem:
         self.particle_velocities = np.zeros((CONFIG.MAX_PARTICLES, 3), dtype=np.float32)
         self.particle_accelerations = np.zeros((CONFIG.MAX_PARTICLES, 3), dtype=np.float32)
         self.particle_materials = np.zeros(CONFIG.MAX_PARTICLES, dtype=np.int32)
+        self.particle_types = np.ones(CONFIG.MAX_PARTICLES, dtype=np.int32)  # 1=水, 2=酸性, 3=碱性
 
         # 批量处理临时缓冲区
         self.temp_positions = np.empty((CONFIG.BATCH_SIZE, 3), dtype=np.float32)
@@ -548,11 +549,82 @@ class MeshSystem:
         print(f"Using PySPlisHSPlasH default scene initialization, particle count: {self.current_particle_num}")
         return self.current_particle_num
 
+    def add_particles(self, positions: np.ndarray, fluid_type: int = 1):
+        """添加新的粒子到系统中
+        
+        Args:
+            positions: 粒子位置数组，shape (N, 3)
+            fluid_type: 液体类型 1=水, 2=酸性溶液, 3=碱性溶液
+        """
+        if positions is None or len(positions) == 0:
+            return
+            
+        n_new = len(positions)
+        available_space = CONFIG.MAX_PARTICLES - self.current_particle_num
+        
+        if n_new > available_space:
+            print(f"⚠ 粒子数量超出限制: 需要 {n_new} 个，剩余空间 {available_space} 个")
+            n_new = available_space
+            positions = positions[:n_new]
+            
+        if n_new <= 0:
+            return
+            
+        # 添加粒子到系统
+        start_idx = self.current_particle_num
+        end_idx = start_idx + n_new
+        
+        # 复制位置数据
+        self.particle_positions[start_idx:end_idx] = positions[:n_new]
+        
+        # 设置初始速度为零
+        self.particle_velocities[start_idx:end_idx] = 0.0
+        
+        # 设置粒子类型
+        self.particle_types[start_idx:end_idx] = fluid_type
+        
+        # 设置材料类型
+        self.particle_materials[start_idx:end_idx] = 0  # 默认材料
+        
+        # 更新粒子计数
+        self.current_particle_num = end_idx
+        
+        print(f"✓ 添加了 {n_new} 个类型{fluid_type}的粒子，总粒子数: {self.current_particle_num}")
+    
+    def get_particle_colors_by_type(self) -> np.ndarray:
+        """根据粒子类型获取颜色
+        
+        Returns:
+            colors: (N, 3) RGB颜色数组，值范围[0,1]
+        """
+        if self.current_particle_num == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+            
+        colors = np.zeros((self.current_particle_num, 3), dtype=np.float32)
+        types = self.particle_types[:self.current_particle_num]
+        
+        # 根据类型设置颜色
+        # 1=水(蓝色), 2=酸性(红色), 3=碱性(绿色)
+        colors[types == 1] = [0.2, 0.6, 1.0]  # 蓝色
+        colors[types == 2] = [1.0, 0.3, 0.3]  # 红色
+        colors[types == 3] = [0.3, 1.0, 0.3]  # 绿色
+        
+        return colors
+    
     def get_system_stats(self) -> Dict:
         """Get system statistics - 增强版"""
+        # 统计各类型粒子数量
+        type_counts = {}
+        if self.current_particle_num > 0:
+            types = self.particle_types[:self.current_particle_num]
+            unique_types, counts = np.unique(types, return_counts=True)
+            for t, c in zip(unique_types, counts):
+                type_counts[f'type_{int(t)}'] = int(c)
+        
         return {
             'frame': self.current_frame,
             'particle_count': self.current_particle_num,
+            'particle_types': type_counts,
             'mesh_vertices': self.performance_stats['total_mesh_vertices'],
             'mesh_triangles': self.performance_stats['total_mesh_triangles'],
             'memory_usage_mb': self.performance_stats['memory_usage_mb'],

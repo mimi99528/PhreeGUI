@@ -19,6 +19,7 @@ import os
 import time
 import json
 import logging
+import math
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import numpy as np
@@ -848,6 +849,60 @@ class CoupledSimulationMainWindow(QMainWindow):
         perf_group.setLayout(perf_layout)
         layout.addWidget(perf_group)
         
+        # 摄像机控制
+        camera_group = QGroupBox("摄像机控制")
+        camera_layout = QGridLayout()
+        
+        camera_layout.addWidget(QLabel("水平角度:"), 0, 0)
+        self.camera_angle_x_label = QLabel("0.00")
+        camera_layout.addWidget(self.camera_angle_x_label, 0, 1)
+        
+        camera_layout.addWidget(QLabel("垂直角度:"), 0, 2)
+        self.camera_angle_y_label = QLabel("0.00")
+        camera_layout.addWidget(self.camera_angle_y_label, 0, 3)
+        
+        camera_layout.addWidget(QLabel("距离:"), 1, 0)
+        self.camera_distance_label = QLabel("1.00")
+        camera_layout.addWidget(self.camera_distance_label, 1, 1)
+        
+        # 重置摄像机按钮
+        self.reset_camera_btn = QPushButton("重置摄像机")
+        self.reset_camera_btn.clicked.connect(self.reset_camera_view)
+        camera_layout.addWidget(self.reset_camera_btn, 1, 2, 1, 2)
+        
+        camera_group.setLayout(camera_layout)
+        layout.addWidget(camera_group)
+        
+        # 粒子生成控制
+        particle_group = QGroupBox("粒子生成控制")
+        particle_layout = QGridLayout()
+        
+        particle_layout.addWidget(QLabel("当前液体类型:"), 0, 0)
+        self.fluid_type_label = QLabel("1 (水)")
+        self.fluid_type_label.setStyleSheet("color: #4fc3f7; font-weight: bold;")
+        particle_layout.addWidget(self.fluid_type_label, 0, 1)
+        
+        # 液体类型说明
+        type_info = QLabel("鼠标左键: 生成粒子\nCtrl+滚轮: 切换液体类型\n右键拖拽: 旋转视角")
+        type_info.setStyleSheet("color: #aaaaaa; font-size: 9px;")
+        particle_layout.addWidget(type_info, 1, 0, 1, 2)
+        
+        # 液体类型详细说明
+        fluid_descriptions = [
+            "1号液体: 水 (默认)",
+            "2号液体: 酸性溶液",
+            "3号液体: 碱性溶液"
+        ]
+        self.fluid_desc_labels = []
+        for i, desc in enumerate(fluid_descriptions):
+            label = QLabel(desc)
+            label.setStyleSheet(f"color: {'#4fc3f7' if i == 0 else '#888888'}; font-size: 10px;")
+            particle_layout.addWidget(label, 2+i, 0, 1, 2)
+            self.fluid_desc_labels.append(label)
+        
+        particle_group.setLayout(particle_layout)
+        layout.addWidget(particle_group)
+        
         layout.addStretch()
         return widget
     
@@ -910,6 +965,21 @@ class CoupledSimulationMainWindow(QMainWindow):
                     self.renderer = renderer
                     self.ctx = None
                     
+                    # 鼠标控制相关属性
+                    self.last_pos = None
+                    self.is_dragging = False
+                    self.drag_button = None
+                    
+                    # 粒子生成相关属性
+                    self.current_fluid_type = 1  # 当前液体类型 (1, 2, 3)
+                    self.is_generating_particles = False
+                    self.particle_generation_timer = QTimer()
+                    self.particle_generation_timer.timeout.connect(self.continue_particle_generation)
+                    self.particle_generation_timer.setInterval(50)  # 50ms间隔持续生成
+                    
+                    # 设置鼠标跟踪
+                    self.setMouseTracking(True)
+                    
                 def initializeGL(self):
                     try:
                         import moderngl
@@ -922,6 +992,65 @@ class CoupledSimulationMainWindow(QMainWindow):
                             print("✓ 启用pH颜色可视化渲染")
                     except Exception as e:
                         print(f"OpenGL初始化失败: {e}")
+                
+                def mousePressEvent(self, event):
+                    """鼠标按下事件 - 开始拖拽或粒子生成"""
+                    if event.button() == Qt.LeftButton:
+                        # 左键：开始粒子生成
+                        self.is_generating_particles = True
+                        self.generate_particles_at_mouse(event.pos())
+                        self.particle_generation_timer.start()
+                        event.accept()
+                    elif event.button() == Qt.RightButton:
+                        # 右键：开始摄像机拖拽
+                        self.is_dragging = True
+                        self.drag_button = event.button()
+                        self.last_pos = event.pos()
+                        event.accept()
+                
+                def mouseReleaseEvent(self, event):
+                    """鼠标释放事件 - 结束拖拽或粒子生成"""
+                    if event.button() == Qt.LeftButton:
+                        # 停止粒子生成
+                        self.is_generating_particles = False
+                        self.particle_generation_timer.stop()
+                        event.accept()
+                    elif event.button() == self.drag_button:
+                        # 结束摄像机拖拽
+                        self.is_dragging = False
+                        self.drag_button = None
+                        self.last_pos = None
+                        event.accept()
+                
+                def mouseMoveEvent(self, event):
+                    """鼠标移动事件 - 处理摄像机旋转和粒子生成"""
+                    if self.is_dragging and self.last_pos is not None:
+                        delta = event.pos() - self.last_pos
+                        
+                        # 根据拖拽方向调整摄像机角度
+                        sensitivity = 0.01  # 敏感度调节
+                        
+                        if self.drag_button == Qt.RightButton:
+                            # 右键拖拽：围绕注视点旋转摄像机
+                            self.renderer.camera_angle_x += delta.x() * sensitivity
+                            self.renderer.camera_angle_y -= delta.y() * sensitivity  # Y轴反向更符合直觉
+                            
+                            # 限制垂直角度范围，避免万向节锁
+                            self.renderer.camera_angle_y = max(-math.pi/2 + 0.1, 
+                                                              min(math.pi/2 - 0.1, 
+                                                                  self.renderer.camera_angle_y))
+                            
+                            # 触发重绘
+                            self.update()
+                        
+                        self.last_pos = event.pos()
+                        event.accept()
+                    elif self.is_generating_particles:
+                        # 持续生成粒子
+                        self.generate_particles_at_mouse(event.pos())
+                        event.accept()
+                    else:
+                        super().mouseMoveEvent(event)
                 
                 def paintGL(self):
                     if self.ctx:
@@ -945,9 +1074,201 @@ class CoupledSimulationMainWindow(QMainWindow):
                             import traceback
                             traceback.print_exc()
                 
+                def wheelEvent(self, event):
+                    """鼠标滚轮事件 - 缩放摄像机距离和切换液体类型"""
+                    delta = event.angleDelta().y()
+                    
+                    if event.modifiers() & Qt.ControlModifier:
+                        # Ctrl+滚轮：切换液体类型
+                        if delta > 0:
+                            self.current_fluid_type = min(3, self.current_fluid_type + 1)
+                        else:
+                            self.current_fluid_type = max(1, self.current_fluid_type - 1)
+                        print(f"切换到液体类型 {self.current_fluid_type}")
+                    else:
+                        # 普通滚轮：缩放摄像机距离
+                        zoom_sensitivity = 0.1
+                        
+                        # 调整摄像机距离
+                        if delta > 0:
+                            self.renderer.camera_distance *= (1.0 - zoom_sensitivity)
+                        else:
+                            self.renderer.camera_distance *= (1.0 + zoom_sensitivity)
+                        
+                        # 限制距离范围
+                        self.renderer.camera_distance = max(0.5, min(10.0, self.renderer.camera_distance))
+                    
+                    # 触发重绘
+                    self.update()
+                    event.accept()
+                
                 def resizeGL(self, width, height):
                     if self.ctx and width > 0 and height > 0:
                         self.ctx.viewport = (0, 0, width, height)
+                
+                def generate_particles_at_mouse(self, mouse_pos):
+                    """在鼠标位置生成粒子 - 修复版"""
+                    try:
+                        # 获取OpenGL坐标
+                        size = self.size()
+                        x = mouse_pos.x()
+                        y = mouse_pos.y()  # 不再需要Y轴翻转，screen_to_world中已经处理
+                        
+                        print(f"鼠标位置: ({x}, {y}), 窗口大小: ({size.width()}, {size.height()})")
+                        
+                        # 创建投影和视图矩阵
+                        projection = self.create_projection_matrix(size.width(), size.height())
+                        view = self.create_view_matrix()
+                        
+                        # 计算世界坐标
+                        world_pos = self.screen_to_world(x, y, size.width(), size.height(), 
+                                                        projection, view)
+                        
+                        # 限制生成位置在合理范围内（更适合容器的空间）
+                        world_pos[0] = np.clip(world_pos[0], -0.6, 4)  # x范围
+                        world_pos[1] = np.clip(world_pos[1], 0.1, 6)   # y范围(高度) - 更低的位置
+                        world_pos[2] = np.clip(world_pos[2], -0.6, 4)  # z范围
+                        
+                        # 生成粒子
+                        print(f"在世界坐标 {world_pos} 生成液体粒子 (类型{self.current_fluid_type})")
+                        self.add_fluid_particles(world_pos, self.current_fluid_type)
+                        
+                    except Exception as e:
+                        print(f"粒子生成错误: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                def continue_particle_generation(self):
+                    """持续生成粒子（当鼠标按下时）"""
+                    if self.is_generating_particles:
+                        cursor_pos = self.mapFromGlobal(self.cursor().pos())
+                        if self.rect().contains(cursor_pos):
+                            self.generate_particles_at_mouse(cursor_pos)
+                
+                def create_projection_matrix(self, width, height):
+                    """创建投影矩阵 - 修复版"""
+                    import numpy as np
+                    fov = 60.0
+                    aspect = width / height if height > 0 else 1.0
+                    near = 0.1
+                    far = 100.0
+                    
+                    f = 1.0 / math.tan(math.radians(fov) / 2.0)
+                    nf = 1.0 / (near - far)
+                    
+                    proj = np.zeros((4, 4), dtype=np.float32)
+                    proj[0, 0] = f / aspect
+                    proj[1, 1] = f
+                    proj[2, 2] = (far + near) * nf
+                    proj[2, 3] = -1.0
+                    proj[3, 2] = 2.0 * far * near * nf
+                    proj[3, 3] = 0.0
+                    return proj
+                
+                def create_view_matrix(self):
+                    """创建视图矩阵 - 修复版"""
+                    import numpy as np
+                    
+                    # 计算摄像机位置
+                    cam_x = self.renderer.camera_target[0] + self.renderer.camera_distance * math.sin(self.renderer.camera_angle_x) * math.cos(self.renderer.camera_angle_y)
+                    cam_y = self.renderer.camera_target[1] + self.renderer.camera_distance * math.sin(self.renderer.camera_angle_y)
+                    cam_z = self.renderer.camera_target[2] + self.renderer.camera_distance * math.cos(self.renderer.camera_angle_x) * math.cos(self.renderer.camera_angle_y)
+                    print(f"摄像机位置: ({cam_x}, {cam_y}, {cam_z})")
+                    # 计算视图矩阵 (LookAt矩阵)
+                    eye = np.array([cam_x, cam_y, cam_z])
+                    target = np.array(self.renderer.camera_target)
+                    up = np.array([0.0, 1.0, 0.0])
+                    
+                    # 前向向量
+                    f = target - eye
+                    f = f / np.linalg.norm(f)
+                    
+                    # 右向量
+                    s = np.cross(f, up)
+                    s = s / np.linalg.norm(s)
+                    
+                    # 上向量
+                    u = np.cross(s, f)
+                    
+                    # 构造视图矩阵
+                    view = np.eye(4, dtype=np.float32)
+                    view[0, :3] = s
+                    view[1, :3] = u
+                    view[2, :3] = -f
+                    view[0, 3] = -np.dot(s, eye)
+                    view[1, 3] = -np.dot(u, eye)
+                    view[2, 3] = np.dot(f, eye)
+                    print("视图矩阵:",  view)
+                    return view
+                
+                def screen_to_world(self, x, y, width, height, projection, view):
+                    """屏幕坐标转世界坐标 - 修复版"""
+                    import numpy as np
+                    
+                    # 归一化设备坐标 (-1到1)
+                    ndc_x = (2.0 * x / width) - 1.0
+                    ndc_y = 1.0 - (2.0 * y / height)  # Y轴翻转，因为OpenGL Y轴向上
+                    
+                    # 构造近平面上的齐次坐标 (z=-1表示近平面)
+                    ndc_near = np.array([ndc_x, ndc_y, -1.0, 1.0])
+                    
+                    # 计算视图-投影矩阵的逆矩阵
+                    try:
+                        vp_matrix = projection @ view
+                        inv_vp = np.linalg.inv(vp_matrix)
+                    except np.linalg.LinAlgError:
+                        # 如果矩阵不可逆，使用单独的逆矩阵
+                        inv_proj = np.linalg.inv(projection)
+                        inv_view = np.linalg.inv(view)
+                        inv_vp = inv_view @ inv_proj
+                    
+                    # 转换到世界坐标
+                    world_pos = inv_vp @ ndc_near
+                    
+                    # 齐次坐标归一化
+                    if abs(world_pos[3]) > 1e-8:  # 避免除零
+                        world_pos = world_pos / world_pos[3]
+                    
+                    result = world_pos[:3]
+                    
+                    # 添加调试信息
+                    print(f"坐标转换: 屏幕({x},{y}) -> NDC({ndc_x:.3f},{ndc_y:.3f}) -> 世界{result}")
+                    
+                    return result
+                
+                def add_fluid_particles(self, position, fluid_type):
+                    """添加流体粒子 - 修复版"""
+                    try:
+                        if hasattr(self.parent(), 'mesh_system'):
+                            mesh_system = self.parent().mesh_system
+                            
+                            # 生成多个粒子形成小团
+                            particle_positions = []
+                            for i in range(8):  # 每次生成8个粒子创造更好的效果
+                                # 添加随机偏移创造自然效果
+                                offset = np.random.normal(0, 0.03, 3)  # 标准差0.03的正态分布
+                                pos = position + offset
+                                particle_positions.append(pos)
+                            
+                            # 转换为numpy数组
+                            positions_array = np.array(particle_positions, dtype=np.float32)
+                            
+                            # 添加到网格系统
+                            if hasattr(mesh_system, 'add_particles'):
+                                mesh_system.add_particles(positions_array, fluid_type)
+                                print(f"✓ 成功添加 {len(particle_positions)} 个类型{fluid_type}的粒子")
+                                print(f"  生成位置: {position}")
+                                print(f"  粒子范围: [{np.min(positions_array[:,1]):.3f}, {np.max(positions_array[:,1]):.3f}] (Y轴)")
+                            else:
+                                print("✗ 网格系统缺少add_particles方法")
+                                return
+                            
+                            # 触发重绘
+                            self.update()
+                    except Exception as e:
+                        print(f"✗ 添加粒子失败: {e}")
+                        import traceback
+                        traceback.print_exc()
             
             self.opengl_widget = QOpenGLWrapper(self.opengl_renderer)
             layout.addWidget(self.opengl_widget)
@@ -1003,6 +1324,11 @@ class CoupledSimulationMainWindow(QMainWindow):
         self.simulation_worker.error_occurred.connect(self.on_simulation_error)
         self.simulation_worker.simulation_initialized.connect(self.on_simulation_initialized)
         self.simulation_worker.particles_updated.connect(self.on_particles_updated)
+        
+        # 创建摄像机参数更新定时器
+        self.camera_update_timer = QTimer()
+        self.camera_update_timer.timeout.connect(self.update_camera_labels)
+        self.camera_update_timer.start(100)  # 每100ms更新一次
         
         # 启动线程
         self.simulation_thread.start()
@@ -1139,6 +1465,47 @@ class CoupledSimulationMainWindow(QMainWindow):
         
         self.status_bar.showMessage("仿真已重置")
     
+    def reset_camera_view(self):
+        """重置摄像机视图到默认位置"""
+        if hasattr(self, 'opengl_renderer'):
+            # 重置摄像机参数到默认值
+            self.opengl_renderer.camera_angle_x = 0.5
+            self.opengl_renderer.camera_angle_y = 0.3
+            self.opengl_renderer.camera_distance = 1.0
+            
+            # 更新显示标签
+            self.update_camera_labels()
+            
+            # 触发重绘
+            if hasattr(self, 'opengl_widget'):
+                self.opengl_widget.update()
+            
+            self.status_bar.showMessage("摄像机视图已重置")
+    
+    def update_camera_labels(self):
+        """更新摄像机参数显示标签"""
+        if hasattr(self, 'opengl_renderer'):
+            # 更新角度显示（转换为度数便于理解）
+            angle_x_deg = math.degrees(self.opengl_renderer.camera_angle_x)
+            angle_y_deg = math.degrees(self.opengl_renderer.camera_angle_y)
+            
+            self.camera_angle_x_label.setText(f"{angle_x_deg:.1f}°")
+            self.camera_angle_y_label.setText(f"{angle_y_deg:.1f}°")
+            self.camera_distance_label.setText(f"{self.opengl_renderer.camera_distance:.2f}")
+            
+            # 更新液体类型显示
+            if hasattr(self, 'opengl_widget') and hasattr(self.opengl_widget, 'current_fluid_type'):
+                fluid_type = self.opengl_widget.current_fluid_type
+                fluid_names = ["水", "酸性溶液", "碱性溶液"]
+                self.fluid_type_label.setText(f"{fluid_type} ({fluid_names[fluid_type-1]})")
+                
+                # 更新液体类型描述颜色
+                for i, label in enumerate(self.fluid_desc_labels):
+                    if i == fluid_type - 1:
+                        label.setStyleSheet("color: #4fc3f7; font-weight: bold; font-size: 10px;")
+                    else:
+                        label.setStyleSheet("color: #888888; font-size: 10px;")
+    
     def update_speed(self, value: int):
         """更新仿真速度"""
         speed = value / 10.0
@@ -1187,6 +1554,9 @@ class CoupledSimulationMainWindow(QMainWindow):
                 # 强制触发重绘
                 self.opengl_widget.update()
                 logger.debug(f"更新了 {len(particle_positions)} 个粒子到渲染器")
+                
+                # 更新摄像机参数显示
+                self.update_camera_labels()
                 
                 # 调试信息：检查粒子位置是否有变化
                 if len(particle_positions) > 0:
@@ -1251,6 +1621,10 @@ class CoupledSimulationMainWindow(QMainWindow):
     
     def closeEvent(self, event):
         """窗口关闭事件 - 修复版"""
+        # 停止摄像机更新定时器
+        if hasattr(self, 'camera_update_timer'):
+            self.camera_update_timer.stop()
+            
         # 停止仿真线程
         if self.simulation_worker:
             self.simulation_worker.cleanup()
