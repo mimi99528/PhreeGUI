@@ -705,6 +705,11 @@ class CoupledSimulation:
             if b:
                 swig_mapping[i] = c
                 c += 1
+        
+        # ── [FIX 1] 定义 inactive_cell_indices（之前被注释掉导致 NameError）──
+        inactive_cell_indices = np.where(~significant_cells_mask)[0]
+        active_cell_positions = np.where(significant_cells_mask)[0]
+        
         print([float(i) for i in conc_flat_active])
         print("swig_mapping:", swig_mapping)
             
@@ -713,6 +718,15 @@ class CoupledSimulation:
         except Exception as e:
             _chem_logger.warning(f"Frame {self.frame_count}: CreateMappingSWIG 失败: {e}")
             return cell_conc.copy()
+
+        # ── [FIX 2] CreateMappingSWIG 之后必须重新设置物理参数 ──
+        # 否则活跃单元的 RepresentativeVolume 会被清零，导致水质量=0
+        # n_active_cells = active_counter
+        self.rm.SetSaturationUser([1.0] * self.chem_field.n_cells)
+        self.rm.SetRepresentativeVolume([1.0] *  self.chem_field.n_cells)
+        self.rm.SetPorosity([0.2] *  self.chem_field.n_cells)
+        self.rm.SetTemperature([25.0] *  self.chem_field.n_cells)
+        self.rm.SetPressure([1.0] *  self.chem_field.n_cells)
     
         # 重试逻辑
         current_dt = dt
@@ -774,10 +788,19 @@ class CoupledSimulation:
             # 将活跃单元的计算结果映射回对应位置
             result_2d = result_conc_flat.reshape((active_counter, self.n_comps))
                 
-            # 将计算结果映射回活跃单元
-            active_cell_positions = np.where(significant_cells_mask)[0]
+            # ── [FIX 3] 将计算结果映射回活跃单元 ──
+            # 注意：SetComponentH2O(False) 模式下，PHREEQCRM返回的 H/O 浓度包含水中的H/O，
+            # 不能直接循环存回粒子再传给下一帧。
+            # 解决方法：只存储非H非O的溶质组分，H和O从平衡状态重算（不覆盖存储）。
+            # 或者更简单：不管H/O，让PHREEQCRM每次从溶液定义中重算，
+            # 即：不要把 result_2d 的 H（index 0）和 O（index 1）存回粒子。
+            HO_INDICES = [0, 1]  # H 和 O 在 SetComponentH2O(False) 模式下的固定索引
             for i, global_cell_idx in enumerate(active_cell_positions):
                 new_conc[global_cell_idx] = result_2d[i]
+                # 将 H 和 O 的存储值重置为初始平衡值，避免下一帧传入异常大的浓度
+                if self._initial_equilibrium_conc is not None:
+                    new_conc[global_cell_idx, HO_INDICES] = \
+                        self._initial_equilibrium_conc[global_cell_idx, HO_INDICES]
                 
             # 非活跃单元保持原始背景浓度
             for inactive_idx in inactive_cell_indices:
