@@ -37,6 +37,7 @@ CHEM_MAX_RETRIES: int = 3       # PHREEQCRM.RunCells() 失败时最大重试次�
 DEFAULT_PARTICLE_RADIUS: float = 0.05          # 来自 Config.PARTICLE_RADIUS
 DEFAULT_PARTICLE_VOLUME: float = (4.0 / 3.0) * np.pi * DEFAULT_PARTICLE_RADIUS ** 3
 
+last_data = None
 
 # ==================== 数据结构 ====================
 
@@ -136,7 +137,7 @@ class CoupledSimulation:
         chem_step_ratio: int = CHEM_STEP_RATIO,
         chem_grid_dim: int = CHEM_GRID_DIM,
         particle_volume: float = DEFAULT_PARTICLE_VOLUME,
-        chem_dt: float = 86400.0,
+        chem_dt: float = 0.017,
     ):
         self.mesh_system = mesh_system
         self.rm: Optional[phreeqcrm.PhreeqcRM] = phreeqc_rm
@@ -218,10 +219,11 @@ class CoupledSimulation:
                 
                 # 运行初始平衡计算
                 status = self.rm.RunCells()
+                print(self.rm.GetSelectedOutput())
+                print(self.chem_field.cell_particles)
                 if status == 0:
                     # 成功计算平衡状态，获取浓度
                     equilibrium_conc = np.array(self.rm.GetConcentrations(), dtype=np.float64)
-                    # print(list(equilibrium_conc))
                     n_cells = self.chem_field.n_cells
                     if len(equilibrium_conc) == n_cells * self.n_comps:
                         # 将平衡浓度广播到所有粒子
@@ -252,6 +254,7 @@ class CoupledSimulation:
                         
                         # 广播浓度到粒子
                         self._broadcast_to_particles(cell_conc)
+                        print(self.chem_field.particle_volume)
                         _chem_logger.info("成功使用PHREEQCRM计算初始平衡状态")
                     else:
                         _chem_logger.warning(f"浓度数组长度不匹配: 期望{n_cells * self.n_comps}, 实际{len(equilibrium_conc)}")
@@ -520,7 +523,7 @@ class CoupledSimulation:
             
         _chem_logger.debug(f"[_aggregate_cell_concentrations] 成功聚合 {assigned_particles} 个粒子到 {assigned_cells} 个化学单元")
         _chem_logger.debug(f"[_aggregate_cell_concentrations] 浓度范围: [{np.min(cell_conc):.2e}, {np.max(cell_conc):.2e}]")
-        print("cell_conc:", cell_conc)
+        # print("cell_conc:", cell_conc)
         return cell_conc
 
     # ------------------------------------------------------------------
@@ -726,25 +729,52 @@ class CoupledSimulation:
             conc = cell_conc[cell_id]
             for pid in particles:
                 self._particle_solutions[pid] = conc
-        # 抽一个粒子出来看看数据对不对
         if len(self._particle_solutions) > 0:
             print(f"[CoupledSim] 第0个粒子的浓度: {self._particle_solutions[0]}")
         else:
             print("[CoupledSim] 粒子溶液数组为空")
 
+    def _identify_inactive_cells(self, cell_conc: np.ndarray) -> np.ndarray:
+        """
+        识别不活跃的化学单元（复用_run_chemical_step中的逻辑）
+            
+        Args:
+            cell_conc: (n_cells, n_comps) 单元浓度矩阵
+                
+        Returns:
+            inactive_mask: (n_cells,) bool数组，True表示不活跃单元
+        """
+        n_cells = self.chem_field.n_cells
+            
+        # 复用_run_chemical_step中的活跃单元识别逻辑
+        major_components = [0, 1, 2]  # H, O, Charge
+        other_comps_indices = [i for i in range(self.n_comps) if i not in major_components]
+            
+        # 检查哪些单元有粒子且不是纯水
+        if other_comps_indices:
+            other_comps_zero = np.all(cell_conc[:, other_comps_indices] == 0.0, axis=1)
+            has_particles = np.array([len(self.chem_field.cell_particles[i]) > 0 for i in range(n_cells)])
+            significant_cells_mask = has_particles & ~other_comps_zero
+        else:
+            significant_cells_mask = np.any(cell_conc > 1e-9, axis=1)
+                
+        # 不活跃单元 = 非显著单元
+        inactive_mask = ~significant_cells_mask
+        return inactive_mask
+        
     def _calculate_ph_from_concentrations(self, h_index: int = 0) -> Optional[np.ndarray]:
         """
         从粒子浓度数据计算pH值（回退方案）
-        
+            
         Args:
             h_index: H+组分的索引
-            
+                
         Returns:
             ph_array: (n_active_particles,) float64 数组，或None
         """
         if self._particle_solutions is None:
             return None
-            
+                
         n_active_particles = (
             self.mesh_system.current_particle_num
             if self.mesh_system is not None
@@ -754,10 +784,10 @@ class CoupledSimulation:
                 else 0
             )
         )
-        
+            
         if n_active_particles == 0:
             return None
-            
+                
         # 确保H+索引有效
         if h_index >= self.n_comps:
             # 尝试查找H+组分
@@ -765,12 +795,12 @@ class CoupledSimulation:
                 h_index = self.comp_names.index('H+')
             else:
                 h_index = 0  # 默认使用第一个组分
-        
+            
         # 从粒子溶液中提取H+浓度并计算pH
         h_concentrations = self._particle_solutions[:n_active_particles, h_index]
         # pH = -log10[H+]，注意浓度单位转换
         ph_values = -np.log10(np.maximum(h_concentrations, 1e-14))  # 避免log(0)
-        
+            
         _chem_logger.debug(f"通过浓度计算得到 {n_active_particles} 个粒子的pH值，范围: [{np.min(ph_values):.2f}, {np.max(ph_values):.2f}]")
         return ph_values
 
@@ -782,26 +812,30 @@ class CoupledSimulation:
     def get_particle_ph(self, ph_component_index: int = 0) -> Optional[np.ndarray]:
         """
         使用PHREEQCRM的SelectedOutput获取每个粒子的pH值。
-
+        对于不活跃的化学单元（没有粒子或纯水单元），返回pH值7.0（纯水）。
+    
         Args:
             ph_component_index: 对应pH的组分索引（默认0，通常是H+）
-
+    
         Returns:
             ph_array: (n_active_particles,) float64 数组，或None
         """
         if self.rm is None or self._particle_solutions is None:
             return None
-            
+                
         try:
+            # 首先聚合当前单元浓度以识别不活跃单元
+            cell_conc = self._aggregate_cell_concentrations()
+            inactive_cells_mask = self._identify_inactive_cells(cell_conc)
+                
             # 使用SelectedOutput获取pH值
             # PHREEQCRM的SelectedOutput返回的是cell级别的数据（numpy数组格式）
             selected_output = self.rm.GetSelectedOutput()
-            
             if selected_output is not None and selected_output.size > 0:
                 # selected_output已经是numpy数组格式
                 if not isinstance(selected_output, np.ndarray):
                     selected_output = np.array(selected_output, dtype=np.float64)
-                
+                    
                 # 验证SelectedOutput的长度是否匹配化学单元数
                 expected_length = self.chem_field.n_cells
                 if len(selected_output) != expected_length:
@@ -813,7 +847,7 @@ class CoupledSimulation:
                         padded = np.full(expected_length, 7.0, dtype=np.float64)
                         padded[:len(selected_output)] = selected_output
                         selected_output = padded
-                
+                    
                 # 获取当前活跃粒子数
                 n_active_particles = (
                     self.mesh_system.current_particle_num
@@ -824,31 +858,51 @@ class CoupledSimulation:
                         else 0
                     )
                 )
-                
+                    
                 if n_active_particles > 0:
                     # 创建pH数组
                     ph_values = np.zeros(n_active_particles, dtype=np.float64)
-                    
+                        
                     # 根据粒子所在的化学单元获取对应的pH值
                     for i in range(n_active_particles):
                         if self._particle_cell_ids is not None and i < len(self._particle_cell_ids):
                             cell_id = self._particle_cell_ids[i]
                             if 0 <= cell_id < len(selected_output):
-                                # 从SelectedOutput获取该单元的pH值
-                                ph_values[i] = selected_output[cell_id]
+                                # 检查该单元是否为不活跃单元
+                                if inactive_cells_mask[cell_id]:
+                                    # 不活跃单元返回纯水pH值7.0
+                                    ph_values[i] = 7.0
+                                else:
+                                    # 从SelectedOutput获取该单元的pH值
+                                    ph_values[i] = selected_output[cell_id]
                             else:
                                 # 如果无法获取，使用默认pH值7.0
                                 ph_values[i] = 7.0
                         else:
                             # 默认pH值
                             ph_values[i] = 7.0
-                    
+                        
                     _chem_logger.debug(f"成功获取 {n_active_particles} 个粒子的pH值，范围: [{np.min(ph_values):.2f}, {np.max(ph_values):.2f}]")
+                    _chem_logger.debug(f"其中不活跃单元粒子数: {np.sum(inactive_cells_mask[self._particle_cell_ids[:n_active_particles]])}")
                     return ph_values
-            
+                
             # 如果SelectedOutput不可用，回退到使用粒子溶液数据计算pH
-            return self._calculate_ph_from_concentrations(ph_component_index)
-            
+            # 但在回退方案中也要处理不活跃单元
+            ph_from_conc = self._calculate_ph_from_concentrations(ph_component_index)
+            if ph_from_conc is not None and self._particle_cell_ids is not None:
+                # 为不活跃单元的粒子设置pH值7.0
+                n_particles = len(ph_from_conc)
+                for i in range(n_particles):
+                    if i < len(self._particle_cell_ids):
+                        cell_id = self._particle_cell_ids[i]
+                        if 0 <= cell_id < len(inactive_cells_mask) and inactive_cells_mask[cell_id]:
+                            ph_from_conc[i] = 7.0
+                    
+                _chem_logger.debug(f"通过浓度回退方案获取pH值，其中不活跃单元粒子设置为7.0")
+                return ph_from_conc
+                
+            return ph_from_conc
+                
         except Exception as e:
             _chem_logger.warning(f"获取pH值失败: {e}")
             # 回退方案：使用粒子溶液数据计算pH
@@ -887,6 +941,7 @@ class CoupledSimulation:
                 - chem_time: 化学时间累计（秒，仅化学步帧）
                 - n_particles: 当前活跃粒子数
         """
+        global last_data
         self.frame_count += 1
         stats: Dict = {
             "frame": self.frame_count,
@@ -945,7 +1000,6 @@ class CoupledSimulation:
                 
                 # 2. 调用 PHREEQCRM.RunCells()
                 new_conc = self._run_chemical_step(cell_conc, self.chem_dt)
-                
                 # 3. 广播回单元内所有粒子
                 self._broadcast_to_particles(new_conc)
 

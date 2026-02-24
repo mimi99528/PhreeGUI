@@ -113,6 +113,11 @@ class OpenGLRenderer:
         self.depth_fbo0 = None
         self.depth_fbo1 = None
         self.thick_fbo = None
+        
+        # 新增：彩色粒子专用FBO和纹理
+        self.color_particle_fbo = None
+        self.color_particle_color_tex = None  # 存储粒子颜色
+        self.color_particle_depth_tex = None  # 存储粒子深度
 
         # Shadow mapping
         self.shadow_scale = 1.0
@@ -209,6 +214,11 @@ class OpenGLRenderer:
         self._init_ssfr_resources()
         return True
 
+    def _init_color_particle_resources(self):
+        """初始化彩色粒子渲染资源"""
+        # 这个方法将在 _ensure_ssfr_targets 中被调用
+        pass
+    
     def _init_ssfr_resources(self):
         """初始化SSFR资源"""
         # Quad vertex shader
@@ -306,7 +316,8 @@ class OpenGLRenderer:
         uniform float u_particle_radius_world;
         in vec3 v_color;
         in vec3 v_center_vs;
-        out vec4 frag_color;
+        layout(location = 0) out vec4 frag_color;     // 颜色输出到attachment 0
+        layout(location = 1) out float frag_depth;    // 深度输出到attachment 1
         void main() {
             vec2 p = gl_PointCoord * 2.0 - 1.0;
             float r2 = dot(p, p);
@@ -316,7 +327,8 @@ class OpenGLRenderer:
             float zcap = sqrt(1.0 - r2);
             float surf_z = v_center_vs.z + u_particle_radius_world * zcap;
             vec4 clip = projection * vec4(v_center_vs.xy, surf_z, 1.0);
-            gl_FragDepth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
+            frag_depth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
+            gl_FragDepth = frag_depth;
             
             // 使用传递的颜色
             frag_color = vec4(v_color, 0.8);  // 固定透明度
@@ -425,6 +437,7 @@ class OpenGLRenderer:
         uniform sampler2D u_depth;
         uniform sampler2D u_thick;
         uniform sampler2D u_shadow;
+        uniform sampler2D u_particle_color;  // 新增：粒子颜色纹理
         uniform vec2 u_texel;
         uniform vec2 u_shadow_texel;
         uniform float u_proj_x;
@@ -441,6 +454,7 @@ class OpenGLRenderer:
         uniform float u_shadow_strength;
         uniform float u_caustic_strength;
         uniform float u_caustic_power;
+        uniform bool u_use_particle_color;   // 新增：是否使用粒子颜色
 
         in vec2 v_uv;
         out vec4 frag_color;
@@ -549,10 +563,23 @@ class OpenGLRenderer:
             vec3 env_refl = sky(refl_dir);
             vec3 env_refr = (length(refr_dir) > 0.5) ? sky(refr_dir) : sky(-V);
 
+            // 基础流体颜色
+            vec3 base_fluid_color = u_water_color;
+            
+            // ★ 新增：如果启用了粒子颜色，则混合粒子颜色
+            if (u_use_particle_color) {
+                vec4 particle_color_sample = texture(u_particle_color, v_uv);
+                // 只有当粒子颜色的alpha > 0.1时才使用
+                if (particle_color_sample.a > 0.1) {
+                    // 混合粒子颜色和基础流体颜色
+                    base_fluid_color = mix(base_fluid_color, particle_color_sample.rgb, particle_color_sample.a * 0.7);
+                }
+            }
+
             // Beer-Lambert: transmitted environment attenuated by absorption (line below),
             // plus in-scattered fluid body color from direct lighting (line after)
-            vec3 refr_color = trans * env_refr + (1.0 - trans) * u_water_color;
-            refr_color += u_water_color * scatter * NdotL * shad;
+            vec3 refr_color = trans * env_refr + (1.0 - trans) * base_fluid_color;
+            refr_color += base_fluid_color * scatter * NdotL * shad;
 
             vec3 color = mix(refr_color, env_refl, fresnel);
             color += vec3(1.0) * spec * (0.3 + 0.7 * fresnel) * shad;
@@ -607,6 +634,9 @@ class OpenGLRenderer:
                 (self.particle_color_vbo, '3f', 'in_color')  # 颜色属性
             ]
         )
+        
+        # 初始化彩色粒子资源
+        self._init_color_particle_resources()
 
     def update_mesh_data(self, vertices, triangles):
         """Update mesh vertex and index data - GPU优化版"""
@@ -716,7 +746,52 @@ class OpenGLRenderer:
         self.depth_fbo1 = self.ctx.framebuffer(
             color_attachments=[self.depth_tex1], depth_attachment=self._depth_rb1)
         self.thick_fbo = self.ctx.framebuffer(color_attachments=[self.thick_tex])
+        
+        # 创建彩色粒子FBO（MRT：Multiple Render Targets）
+        self._ensure_color_particle_targets(w, h)
 
+    def _ensure_color_particle_targets(self, width: int, height: int):
+        """确保彩色粒子渲染目标存在"""
+        if (hasattr(self, '_color_particle_w') and 
+            hasattr(self, '_color_particle_h') and
+            self._color_particle_w == width and 
+            self._color_particle_h == height and 
+            self.color_particle_fbo is not None):
+            return
+        
+        self._color_particle_w = width
+        self._color_particle_h = height
+        
+        # 释放旧资源
+        for obj in (
+            getattr(self, 'color_particle_fbo', None),
+            getattr(self, 'color_particle_color_tex', None),
+            getattr(self, 'color_particle_depth_tex', None),
+            getattr(self, '_color_particle_depth_rb', None)
+        ):
+            try:
+                if obj is not None:
+                    obj.release()
+            except Exception:
+                pass
+        
+        # 创建颜色纹理 (RGBA8)
+        self.color_particle_color_tex = self.ctx.texture((width, height), components=4, dtype='f1')
+        self.color_particle_color_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        
+        # 创建深度纹理 (R32F)
+        self.color_particle_depth_tex = self.ctx.texture((width, height), components=1, dtype='f4')
+        self.color_particle_depth_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        
+        # 创建深度渲染缓冲区
+        self._color_particle_depth_rb = self.ctx.depth_renderbuffer((width, height))
+        
+        # 创建MRT FBO
+        self.color_particle_fbo = self.ctx.framebuffer(
+            color_attachments=[self.color_particle_color_tex, self.color_particle_depth_tex],
+            depth_attachment=self._color_particle_depth_rb
+        )
+    
     def _ensure_shadow_targets(self, width: int, height: int):
         w = CONFIG.SHADOW_MAP_SIZE
         h = CONFIG.SHADOW_MAP_SIZE
@@ -1021,7 +1096,7 @@ class OpenGLRenderer:
 
         self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
 
-        # Pass 1 - Depth
+        # Pass 1 - Depth (原始深度pass)
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.disable(moderngl.BLEND)
 
@@ -1038,33 +1113,36 @@ class OpenGLRenderer:
             p['u_point_scale'].value = 1.0
             self.particle_vao_depth.render(mode=moderngl.POINTS, vertices=self.particle_count)
 
-        # Pass 1.5 - Colored Particles (新增：颜色可视化层)
-        # 注意：这里不返回，继续执行完整的SSFR流程
-        color_particles_rendered = False
-        if hasattr(self, 'use_colored_particles') and self.use_colored_particles and self.particle_count > 0:
-            # 启用混合进行颜色叠加
+        # Pass 1.5 - Colored Particles (新增：独立的颜色渲染pass)
+        if (hasattr(self, 'use_colored_particles') and 
+            self.use_colored_particles and 
+            self.particle_count > 0 and
+            self.particle_colors is not None and 
+            len(self.particle_colors) >= self.particle_count):
+            
+            # 切换到彩色粒子FBO (MRT)
+            self.color_particle_fbo.use()
+            self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
+            # 清除颜色为透明黑色，深度为远平面
+            self.ctx.clear(0.0, 0.0, 0.0, 0.0, depth=1.0)
+            
+            # 启用深度测试和混合
+            self.ctx.enable(moderngl.DEPTH_TEST)
             self.ctx.enable(moderngl.BLEND)
             self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-            # 确保有颜色数据
-            if self.particle_colors is not None and len(self.particle_colors) >= self.particle_count:
-                # 渲染带颜色的粒子作为可视化层
-                p = self.particle_color_prog
-                p['projection'].write(projection.tobytes())
-                p['view'].write(view.tobytes())
-                p['u_particle_radius_world'].value = r_world
-                p['u_viewport_h'].value = float(self._ssfr_h)
-                p['u_point_scale'].value = 1.0
-                self.particle_vao_colored.render(mode=moderngl.POINTS, vertices=self.particle_count)
-
-                color_particles_rendered = True
-                print(f"✓ 渲染了 {self.particle_count} 个彩色粒子")
-            else:
-                print("⚠ 缺少粒子颜色数据，跳过彩色渲染")
             
-            # 重要：不清除深度测试，继续执行后续步骤
-            # 但保持混合模式开启以便颜色能够显示
-            # self.ctx.disable(moderngl.BLEND)  # 注释掉这行，保持混合开启
-
+            # 渲染带颜色的粒子
+            p = self.particle_color_prog
+            p['projection'].write(projection.tobytes())
+            p['view'].write(view.tobytes())
+            p['u_particle_radius_world'].value = r_world
+            p['u_viewport_h'].value = float(self._ssfr_h)
+            p['u_point_scale'].value = 1.0
+            self.particle_vao_colored.render(mode=moderngl.POINTS, vertices=self.particle_count)
+            
+            print(f"✓ 渲染了 {self.particle_count} 个彩色粒子")
+        
+        self.ctx.disable(moderngl.BLEND)
 
         # Pass 2 - Bilateral filtering with clean ping-pong logic
         self.ctx.disable(moderngl.DEPTH_TEST)
@@ -1149,12 +1227,29 @@ class OpenGLRenderer:
         cp['u_caustic_strength'].value = CONFIG.CAUSTIC_STRENGTH
         cp['u_caustic_power'].value = CONFIG.CAUSTIC_POWER
 
+        # 绑定纹理
         final_depth_tex.use(location=0)
         self.thick_tex.use(location=1)
         self.shadow_tex.use(location=2)
+        
+        # ★ 新增：绑定粒子颜色纹理（如果存在且启用）
+        use_particle_color = (hasattr(self, 'use_colored_particles') and 
+                             self.use_colored_particles and 
+                             self.color_particle_color_tex is not None)
+        
+        if use_particle_color:
+            self.color_particle_color_tex.use(location=3)
+            cp['u_particle_color'].value = 3
+            print("✓ 使用粒子颜色纹理进行渲染")
+        else:
+            # 如果没有粒子颜色，绑定一个默认的黑色纹理或者使用depth纹理作为占位符
+            final_depth_tex.use(location=3)  # 占位符
+            cp['u_particle_color'].value = 3
+            
         cp['u_depth'].value = 0
         cp['u_thick'].value = 1
         cp['u_shadow'].value = 2
+        cp['u_use_particle_color'].value = use_particle_color
 
         self.quad_vao_comp.render(moderngl.TRIANGLES, vertices=6)
 
@@ -1194,7 +1289,10 @@ class OpenGLRenderer:
             'depth_tex0', 'depth_tex1', 'thick_tex',
             'particle_vao_depth', 'particle_vao_thick',
             'particle_depth_prog', 'particle_thick_prog',
-            'bilateral_prog', 'quad_vao_bilateral', 'quad_vao_comp'
+            'bilateral_prog', 'quad_vao_bilateral', 'quad_vao_comp',
+            # 新增的彩色粒子资源
+            'color_particle_fbo', 'color_particle_color_tex', 'color_particle_depth_tex',
+            'particle_vao_colored', 'particle_color_prog', 'particle_color_vbo'
         ]
 
         for attr_name in resources:
