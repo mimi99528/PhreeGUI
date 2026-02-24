@@ -548,6 +548,46 @@ class MainWindow(QMainWindow):
         material_group.setLayout(material_layout)
         layout.addWidget(material_group)
 
+        # ★ 新增：深度缓冲暴露控制
+        depth_exposure_group = QGroupBox("深度缓冲暴露 (用于反投影)")
+        depth_layout = QVBoxLayout()
+        
+        # 启用深度暴露复选框
+        self.depth_exposure_toggle = QCheckBox("启用深度缓冲暴露")
+        self.depth_exposure_toggle.stateChanged.connect(self.toggle_depth_exposure)
+        depth_layout.addWidget(self.depth_exposure_toggle)
+        
+        # 暴露格式选择
+        depth_layout.addWidget(QLabel("暴露格式:"))
+        self.depth_format_combo = QComboBox()
+        self.depth_format_combo.addItems(["numpy数组", "纹理对象", "两者都暴露"])
+        self.depth_format_combo.setCurrentText("numpy数组")
+        self.depth_format_combo.currentTextChanged.connect(self.update_depth_exposure_format)
+        depth_layout.addWidget(self.depth_format_combo)
+        
+        # 暴露频率控制
+        depth_layout.addWidget(QLabel("暴露频率:"))
+        self.depth_frequency_slider = QSlider(Qt.Orientation.Horizontal)
+        self.depth_frequency_slider.setRange(1, 60)  # 1-60 FPS
+        self.depth_frequency_slider.setValue(30)  # 默认30 FPS
+        self.depth_frequency_slider.valueChanged.connect(self.update_depth_frequency)
+        depth_layout.addWidget(self.depth_frequency_slider)
+        self.depth_frequency_label = QLabel("30 FPS")
+        depth_layout.addWidget(self.depth_frequency_label)
+        
+        # 深度数据信息显示
+        self.depth_info_label = QLabel("深度数据: 未启用")
+        self.depth_info_label.setStyleSheet("color: #a0a0a0; font-style: italic;")
+        depth_layout.addWidget(self.depth_info_label)
+        
+        # 测试按钮
+        test_depth_btn = QPushButton("测试深度暴露")
+        test_depth_btn.clicked.connect(self.test_depth_exposure)
+        depth_layout.addWidget(test_depth_btn)
+        
+        depth_exposure_group.setLayout(depth_layout)
+        layout.addWidget(depth_exposure_group)
+
         # Water color controls
         color_group = QGroupBox("水体颜色")
         color_layout = QGridLayout()
@@ -1323,3 +1363,85 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.status_bar.showMessage(f"CSV导出失败: {str(e)}")
                 print(f"CSV export failed: {e}")
+
+    # ★ 新增：深度缓冲暴露控制方法
+    def toggle_depth_exposure(self, state):
+        """切换深度缓冲暴露"""
+        is_enabled = bool(state)
+        
+        if is_enabled:
+            # 启用深度暴露
+            format_map = {
+                "numpy数组": "numpy",
+                "纹理对象": "texture", 
+                "两者都暴露": "both"
+            }
+            format_str = format_map.get(self.depth_format_combo.currentText(), "numpy")
+            
+            # 设置回调函数
+            def depth_callback(depth_data):
+                self._handle_depth_data(depth_data)
+            
+            self.opengl_renderer.enable_depth_exposure(
+                callback=depth_callback,
+                format=format_str
+            )
+            self.depth_info_label.setText("深度数据: 已启用")
+            self.depth_info_label.setStyleSheet("color: green;")
+            print("✓ 深度缓冲暴露已启用")
+        else:
+            # 禁用深度暴露
+            self.opengl_renderer.disable_depth_exposure()
+            self.depth_info_label.setText("深度数据: 已禁用")
+            self.depth_info_label.setStyleSheet("color: #a0a0a0; font-style: italic;")
+            print("✓ 深度缓冲暴露已禁用")
+        
+        self.opengl_widget.update()
+    
+    def update_depth_exposure_format(self, format_text):
+        """更新深度暴露格式"""
+        if self.depth_exposure_toggle.isChecked():
+            # 重新启用以应用新格式
+            self.toggle_depth_exposure(False)
+            self.toggle_depth_exposure(True)
+    
+    def update_depth_frequency(self, value):
+        """更新深度暴露频率"""
+        self.depth_frequency_label.setText(f"{value} FPS")
+        # 这里可以实现频率控制逻辑
+        print(f"深度暴露频率设置为: {value} FPS")
+    
+    def test_depth_exposure(self):
+        """测试深度暴露功能"""
+        if not self.depth_exposure_toggle.isChecked():
+            print("⚠ 请先启用深度缓冲暴露")
+            return
+            
+        # 获取当前深度数据
+        depth_data = self.opengl_renderer.get_exposed_depth_data()
+        if depth_data and 'data' in depth_data:
+            data = depth_data['data']
+            print(f"✓ 成功获取深度数据: {data.shape}, 范围 [{np.min(data):.3f}, {np.max(data):.3f}]")
+            self.status_bar.showMessage(f"深度数据测试成功: {data.shape[0]}x{data.shape[1]} 像素")
+        else:
+            print("✗ 未能获取深度数据")
+            self.status_bar.showMessage("深度数据测试失败")
+    
+    def _handle_depth_data(self, depth_data):
+        """处理接收到的深度数据"""
+        try:
+            # 这里可以实现反投影逻辑
+            # 示例：简单的统计信息
+            if depth_data is not None and len(depth_data) > 0:
+                valid_pixels = np.sum(depth_data > 0)
+                total_pixels = depth_data.size
+                avg_depth = np.mean(depth_data[depth_data > 0]) if valid_pixels > 0 else 0
+                
+                info_text = f"深度数据: {valid_pixels}/{total_pixels} 有效像素, 平均深度: {avg_depth:.3f}"
+                self.depth_info_label.setText(info_text)
+                
+                # 可以在这里添加反投影计算逻辑
+                # 例如：self.perform_back_projection(depth_data)
+                
+        except Exception as e:
+            print(f"✗ 深度数据处理错误: {e}")

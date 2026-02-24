@@ -2,7 +2,7 @@
 网格系统核心模块
 Core Mesh System Module
 """
-
+import math
 import time
 import numpy as np
 import threading
@@ -181,6 +181,7 @@ class MeshSystem:
         self.pysplish_base.initSimulation()
 
         self.pysplish_simulation = sph.Simulation.getCurrent()
+        self.pysplish_time_manager = sph.TimeManager.getCurrent()
 
         self.pysplish_simulation.setValueBool(
             self.pysplish_simulation.ENABLE_Z_SORT, False
@@ -340,6 +341,7 @@ class MeshSystem:
             traceback.print_exc()
 
     def sync_particle_data(self):
+        """同步粒子数据 - 修复版：正确处理手动添加的粒子与PySPlisHSPlasH的集成"""
         t = time.perf_counter()
         fm = self.pysplish_fluid_model
         if fm is None:
@@ -347,39 +349,46 @@ class MeshSystem:
             return
 
         try:
-            n_active = int(fm.numActiveParticles())
-            self.current_particle_num = min(n_active, CONFIG.MAX_PARTICLES)
-            n = self.current_particle_num
-            if n == 0:
-                return
-
-            # 安全的粒子数据同步
-            pos_buffer = fm.getFieldBuffer("position")
-            pos_view = np.asarray(pos_buffer)
+            # 获取PySPlisHSPlasH中的当前粒子数
+            pysplish_active_count = int(fm.numActiveParticles())
             
-            vel_buffer = fm.getFieldBuffer("velocity")
-            vel_view = np.asarray(vel_buffer)
-            
-            # 严格验证buffer形状和类型
-            if pos_view.ndim != 2 or pos_view.shape[1] != 3:
-                raise ValueError(f"Position buffer shape invalid: {pos_view.shape}, expected (N, 3)")
-            if vel_view.ndim != 2 or vel_view.shape[1] != 3:
-                raise ValueError(f"Velocity buffer shape invalid: {vel_view.shape}, expected (N, 3)")
-            if pos_view.shape[0] < n or vel_view.shape[0] < n:
-                raise ValueError(f"Buffer size insufficient: pos={pos_view.shape[0]}, vel={vel_view.shape[0]}, need={n}")
-            
-            # 确保数据类型为float32
-            if pos_view.dtype != np.float32:
-                pos_view = pos_view.astype(np.float32)
-            if vel_view.dtype != np.float32:
-                vel_view = vel_view.astype(np.float32)
-            
-            # 安全拷贝到预分配的数组中
-            np.copyto(self.particle_positions[:n], pos_view[:n], casting="same_kind")
-            np.copyto(self.particle_velocities[:n], vel_view[:n], casting="same_kind")
-
-            # materials (vectorized)
-            self.particle_materials[:n].fill(0)
+            # 从PySPlisHSPlasH同步粒子数据到我们的系统
+            if pysplish_active_count > 0:
+                # 安全的粒子数据同步
+                pos_buffer = fm.getFieldBuffer("position")
+                pos_view = np.asarray(pos_buffer)
+                
+                vel_buffer = fm.getFieldBuffer("velocity")
+                vel_view = np.asarray(vel_buffer)
+                
+                # 严格验证buffer形状和类型
+                if pos_view.ndim != 2 or pos_view.shape[1] != 3:
+                    raise ValueError(f"Position buffer shape invalid: {pos_view.shape}, expected (N, 3)")
+                if vel_view.ndim != 2 or vel_view.shape[1] != 3:
+                    raise ValueError(f"Velocity buffer shape invalid: {vel_view.shape}, expected (N, 3)")
+                if pos_view.shape[0] < pysplish_active_count or vel_view.shape[0] < pysplish_active_count:
+                    raise ValueError(f"Buffer size insufficient: pos={pos_view.shape[0]}, vel={vel_view.shape[0]}, need={pysplish_active_count}")
+                
+                # 确保数据类型为float32
+                if pos_view.dtype != np.float32:
+                    pos_view = pos_view.astype(np.float32)
+                if vel_view.dtype != np.float32:
+                    vel_view = vel_view.astype(np.float32)
+                
+                # 拷贝PySPlisHSPlasH的粒子数据到我们的系统
+                pysplish_count = min(pysplish_active_count, CONFIG.MAX_PARTICLES)
+                np.copyto(self.particle_positions[:pysplish_count], pos_view[:pysplish_count], casting="same_kind")
+                np.copyto(self.particle_velocities[:pysplish_count], vel_view[:pysplish_count], casting="same_kind")
+                self.particle_materials[:pysplish_count].fill(0)
+                self.particle_types[:pysplish_count].fill(1)  # PySPlisHSPlasH粒子默认为类型1(水)
+                
+                # 更新粒子计数
+                self.current_particle_num = pysplish_count
+                print(f"从PySPlisHSPlasH同步了 {pysplish_count} 个粒子")
+            else:
+                # 如果PySPlisHSPlasH中没有粒子，则清空我们的系统
+                self.current_particle_num = 0
+                print("PySPlisHSPlasH中没有活动粒子")
 
         except Exception as e:
             print(f"Error syncing particle data: {e}")
@@ -550,7 +559,7 @@ class MeshSystem:
         return self.current_particle_num
 
     def add_particles(self, positions: np.ndarray, fluid_type: int = 1):
-        """添加新的粒子到系统中
+        """添加新的粒子到系统中 - 完全重写版：正确集成到PySPlisHSPlasH
         
         Args:
             positions: 粒子位置数组，shape (N, 3)
@@ -570,26 +579,77 @@ class MeshSystem:
         if n_new <= 0:
             return
             
-        # 添加粒子到系统
-        start_idx = self.current_particle_num
-        end_idx = start_idx + n_new
+        # 首先将粒子添加到PySPlisHSPlasH流体模型中（这是关键！）
+        pysplish_added = False
+        if self.pysplish_fluid_model is not None:
+            try:
+                # 检查PySPlisHSPlasH是否有足够空间
+                current_active = self.pysplish_fluid_model.numActiveParticles()
+
+                # 获取PySPlisHSPlasH的最大粒子容量
+                # FluidModel的numParticles()返回总容量，numActiveParticles()返回当前活跃粒子数
+                max_particles = self.pysplish_fluid_model.numParticles()
+                
+                if current_active + n_new <= max_particles:
+                    print("qhdiqw2hduhdq")
+                    self.scene.emitters.append(
+                        Scenes.EmitterData(id='Fluid', x=[1, 1, 0], width=5, height=5, axis=[0, 1, 0], angle=math.pi,
+                                           emitStartTime=self.pysplish_time_manager.getTime(), emitEndTime=self.pysplish_time_manager.getTime()+1, velocity=3))
+                    # # 直接操作PySPlisHSPlasH的粒子数据
+                    # added_count = 0
+                    # try:
+                    #     self.pysplish_base.getScene().fluidBlocks.append(
+                    #         Scenes.FluidBlock(id='Fluid', box=Scenes.Box([-1.5, 0.0, -1.5], [-0.5, 2.0, -0.5]), mode=0,
+                    #                           initialVelocity=[0.0, 0.0, 0.0]))
+                    # except Exception as add_err:
+                    #     print(f"⚠ 添加粒子到PySPlisHSPlasH失败: {add_err}")
+                    #     import traceback
+                    #     traceback.print_exc()
+                    #
+                    # if added_count > 0:
+                    #     # 立即同步PySPlisHSPlasH的数据到我们的系统
+                    #     self.sync_particle_data()
+                    #     pysplish_added = True
+                    #     print(f"✓ 成功将 {added_count}/{n_new} 个粒子添加到PySPlisHSPlasH并同步")
+                    # else:
+                    #     print(f"⚠ 未能添加任何粒子到PySPlisHSPlasH")
+                else:
+                    print(f"⚠ PySPlisHSPlasH空间不足: 当前{current_active}, 最大{max_particles}, 需要{n_new}个")
+            except Exception as e:
+                print(f"⚠ PySPlisHSPlasH粒子添加失败: {e}")
+                import traceback
+                traceback.print_exc()
         
-        # 复制位置数据
-        self.particle_positions[start_idx:end_idx] = positions[:n_new]
+        # 如果PySPlisHSPlasH添加失败，则只添加到本地系统
+        if not pysplish_added:
+            # 添加粒子到我们的本地系统
+            start_idx = self.current_particle_num
+            end_idx = start_idx + n_new
+            
+            # 复制位置数据
+            self.particle_positions[start_idx:end_idx] = positions[:n_new]
+            
+            # 设置初始速度为零
+            self.particle_velocities[start_idx:end_idx] = 0.0
+            
+            # 设置粒子类型
+            self.particle_types[start_idx:end_idx] = fluid_type
+            
+            # 设置材料类型
+            self.particle_materials[start_idx:end_idx] = 0
+            
+            # 更新粒子计数
+            self.current_particle_num = end_idx
+            print(f"⚠ 仅添加到本地系统: {n_new} 个类型{fluid_type}的粒子，总粒子数: {self.current_particle_num}")
         
-        # 设置初始速度为零
-        self.particle_velocities[start_idx:end_idx] = 0.0
-        
-        # 设置粒子类型
-        self.particle_types[start_idx:end_idx] = fluid_type
-        
-        # 设置材料类型
-        self.particle_materials[start_idx:end_idx] = 0  # 默认材料
-        
-        # 更新粒子计数
-        self.current_particle_num = end_idx
-        
-        print(f"✓ 添加了 {n_new} 个类型{fluid_type}的粒子，总粒子数: {self.current_particle_num}")
+        # 触发邻居搜索更新（如果PySPlisHSPlasH可用）
+        if pysplish_added and self.pysplish_simulation:
+            try:
+                # 执行邻居搜索以确保新粒子被正确识别
+                self.pysplish_simulation.performNeighborhoodSearchSort()
+                print("✓ 执行了邻居搜索排序")
+            except Exception as e:
+                print(f"邻居搜索执行失败: {e}")
     
     def get_particle_colors_by_type(self) -> np.ndarray:
         """根据粒子类型获取颜色

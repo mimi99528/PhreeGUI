@@ -960,9 +960,10 @@ class CoupledSimulationMainWindow(QMainWindow):
             
             # 创建OpenGL widget包装器
             class QOpenGLWrapper(QOpenGLWidget):
-                def __init__(self, renderer):
+                def __init__(self, renderer, mesh_system):
                     super().__init__()
                     self.renderer = renderer
+                    self.mesh_system = mesh_system  # 直接传入网格系统引用
                     self.ctx = None
                     
                     # 鼠标控制相关属性
@@ -1124,11 +1125,15 @@ class CoupledSimulationMainWindow(QMainWindow):
                         world_pos = self.screen_to_world(x, y, size.width(), size.height(), 
                                                         projection, view)
                         
-                        # 限制生成位置在合理范围内（更适合容器的空间）
-                        world_pos[0] = np.clip(world_pos[0], -0.6, 4)  # x范围
-                        world_pos[1] = np.clip(world_pos[1], 0.1, 6)   # y范围(高度) - 更低的位置
-                        world_pos[2] = np.clip(world_pos[2], -0.6, 4)  # z范围
+                        # 限制生成位置在合理的容器范围内
+                        # 使用更宽松的边界，让粒子能在更大的空间内生成
+                        container_bounds_min = np.array([-2.0, 0.5, -2.0])  # 更大的容器范围
+                        container_bounds_max = np.array([2.0, 3.0, 2.0])    # 更高的Y轴范围
                         
+                        world_pos[0] = np.clip(world_pos[0], container_bounds_min[0], container_bounds_max[0])  # x范围
+                        world_pos[1] = np.clip(world_pos[1], container_bounds_min[1], container_bounds_max[1])  # y范围(高度)
+                        world_pos[2] = np.clip(world_pos[2], container_bounds_min[2], container_bounds_max[2])  # z范围
+
                         # 生成粒子
                         print(f"在世界坐标 {world_pos} 生成液体粒子 (类型{self.current_fluid_type})")
                         self.add_fluid_particles(world_pos, self.current_fluid_type)
@@ -1160,8 +1165,8 @@ class CoupledSimulationMainWindow(QMainWindow):
                     proj[0, 0] = f / aspect
                     proj[1, 1] = f
                     proj[2, 2] = (far + near) * nf
-                    proj[2, 3] = -1.0
-                    proj[3, 2] = 2.0 * far * near * nf
+                    proj[3, 2] = -1.0
+                    proj[2, 3] = 2.0 * far * near * nf
                     proj[3, 3] = 0.0
                     return proj
                 
@@ -1200,77 +1205,125 @@ class CoupledSimulationMainWindow(QMainWindow):
                     view[2, 3] = np.dot(f, eye)
                     print("视图矩阵:",  view)
                     return view
-                
+
                 def screen_to_world(self, x, y, width, height, projection, view):
-                    """屏幕坐标转世界坐标 - 修复版"""
+                    """屏幕坐标转世界坐标 - 射线法（推荐）"""
                     import numpy as np
-                    
-                    # 归一化设备坐标 (-1到1)
+
+                    # 1. 构造射线（从相机出发，穿过屏幕像素）
                     ndc_x = (2.0 * x / width) - 1.0
-                    ndc_y = 1.0 - (2.0 * y / height)  # Y轴翻转，因为OpenGL Y轴向上
-                    
-                    # 构造近平面上的齐次坐标 (z=-1表示近平面)
-                    ndc_near = np.array([ndc_x, ndc_y, -1.0, 1.0])
-                    
-                    # 计算视图-投影矩阵的逆矩阵
+                    ndc_y = 1.0 - (2.0 * y / height)
+
+                    # 射线起点（近裁剪面）
+                    near_point = np.array([ndc_x, ndc_y, -1.0, 1.0])
+                    # 射线方向点（远裁剪面）
+                    far_point = np.array([ndc_x, ndc_y, 1.0, 1.0])
+
+                    vp_matrix = projection @ view
+                    inv_vp = np.linalg.inv(vp_matrix)
+
+                    # 转换到世界空间
+                    near_world = (inv_vp @ near_point)
+                    far_world = (inv_vp @ far_point)
+                    near_world /= near_world[3]
+                    far_world /= far_world[3]
+
+                    ray_origin = near_world[:3]
+                    ray_dir = far_world[:3] - ray_origin
+                    ray_dir = ray_dir / np.linalg.norm(ray_dir)
+
+                    # 2. 获取深度，直接在射线上定位
+                    linear_depth = self._get_depth_from_texture(x, y, width, height)
+
+                    near = 0
+                    far = 100.0
+
+                    if linear_depth is not None and linear_depth > near and linear_depth < far:
+                        # 关键：验证深度是否合理
+                        # 射线上的点 = 原点 + 方向 * 深度
+                        world_pos = ray_origin + ray_dir * linear_depth
+                        print(f"射线法: 深度={linear_depth:.3f}, 世界坐标={world_pos}")
+                        return world_pos
+                    else:
+                        # 回退：使用固定距离或远平面
+                        fallback_dist = 10.0  # 你的场景典型距离
+                        world_pos = ray_origin + ray_dir * fallback_dist
+                        print(f"回退: 距离={fallback_dist}, 世界坐标={world_pos}")
+                        return world_pos
+                
+                def _get_depth_from_texture(self, x, y, width, height):
+                    """从深度纹理获取指定像素的深度值"""
                     try:
-                        vp_matrix = projection @ view
-                        inv_vp = np.linalg.inv(vp_matrix)
-                    except np.linalg.LinAlgError:
-                        # 如果矩阵不可逆，使用单独的逆矩阵
-                        inv_proj = np.linalg.inv(projection)
-                        inv_view = np.linalg.inv(view)
-                        inv_vp = inv_view @ inv_proj
-                    
-                    # 转换到世界坐标
-                    world_pos = inv_vp @ ndc_near
-                    
-                    # 齐次坐标归一化
-                    if abs(world_pos[3]) > 1e-8:  # 避免除零
-                        world_pos = world_pos / world_pos[3]
-                    
-                    result = world_pos[:3]
-                    
-                    # 添加调试信息
-                    print(f"坐标转换: 屏幕({x},{y}) -> NDC({ndc_x:.3f},{ndc_y:.3f}) -> 世界{result}")
-                    
-                    return result
+                        # 确保渲染器已启用深度暴露
+                        if not hasattr(self.renderer, 'expose_depth_buffer') or not self.renderer.expose_depth_buffer:
+                            # 启用深度缓冲暴露
+                            self.renderer.enable_depth_exposure(format='numpy')
+                            print("已启用深度缓冲暴露")
+                        
+                        # 获取最新的深度数据
+                        depth_data = self.renderer.get_exposed_depth_data()
+                        print("深度数据:", depth_data)
+                        if depth_data and 'data' in depth_data:
+                            depth_array = depth_data['data']
+                            # 转换屏幕坐标到纹理坐标
+                            tex_x = int(x)
+                            tex_y = int(y)
+                            # 边界检查
+                            if (0 <= tex_x < depth_array.shape[1] and 
+                                0 <= tex_y < depth_array.shape[0]):
+                                depth_value = depth_array[tex_y, tex_x]
+                                # 只返回有效的深度值（排除背景）
+                                if depth_value > 0:
+                                    return depth_value
+                        
+                        return None
+                    except Exception as e:
+                        print(f"获取深度值失败: {e}")
+                        return None
                 
                 def add_fluid_particles(self, position, fluid_type):
                     """添加流体粒子 - 修复版"""
                     try:
-                        if hasattr(self.parent(), 'mesh_system'):
-                            mesh_system = self.parent().mesh_system
+                        # 直接使用传入的网格系统引用
+                        mesh_system = self.mesh_system
+                        
+                        # 生成多个粒子形成小团
+                        particle_positions = []
+                        for i in range(8):  # 每次生成8个粒子创造更好的效果
+                            # 添加随机偏移创造自然效果
+                            offset = np.random.normal(0, 0.03, 3)  # 标准差0.03的正态分布
+                            pos = position + offset
+                            particle_positions.append(pos)
+                        
+                        # 转换为numpy数组
+                        positions_array = np.array(particle_positions, dtype=np.float32)
+                        print(f"网格系统: {mesh_system}")
+                        # 添加到网格系统
+                        if hasattr(mesh_system, 'add_particles'):
+                            particle_count_before = mesh_system.current_particle_num
+                            mesh_system.add_particles(positions_array, fluid_type)
+                            particle_count_after = mesh_system.current_particle_num
                             
-                            # 生成多个粒子形成小团
-                            particle_positions = []
-                            for i in range(8):  # 每次生成8个粒子创造更好的效果
-                                # 添加随机偏移创造自然效果
-                                offset = np.random.normal(0, 0.03, 3)  # 标准差0.03的正态分布
-                                pos = position + offset
-                                particle_positions.append(pos)
+                            print(f"✓ 成功添加 {len(particle_positions)} 个类型{fluid_type}的粒子")
+                            print(f"  生成位置: {position}")
+                            print(f"  粒子范围: [{np.min(positions_array[:,1]):.3f}, {np.max(positions_array[:,1]):.3f}] (Y轴)")
+                            print(f"  粒子数变化: {particle_count_before} -> {particle_count_after}")
                             
-                            # 转换为numpy数组
-                            positions_array = np.array(particle_positions, dtype=np.float32)
-                            
-                            # 添加到网格系统
-                            if hasattr(mesh_system, 'add_particles'):
-                                mesh_system.add_particles(positions_array, fluid_type)
-                                print(f"✓ 成功添加 {len(particle_positions)} 个类型{fluid_type}的粒子")
-                                print(f"  生成位置: {position}")
-                                print(f"  粒子范围: [{np.min(positions_array[:,1]):.3f}, {np.max(positions_array[:,1]):.3f}] (Y轴)")
-                            else:
-                                print("✗ 网格系统缺少add_particles方法")
-                                return
-                            
-                            # 触发重绘
-                            self.update()
+                            # 更新渲染器中的粒子计数
+                            self.renderer.particle_count = particle_count_after
+                            print(f"  渲染器粒子计数已更新为: {particle_count_after}")
+                        else:
+                            print("✗ 网格系统缺少add_particles方法")
+                            return
+                        
+                        # 触发重绘
+                        self.update()
                     except Exception as e:
                         print(f"✗ 添加粒子失败: {e}")
                         import traceback
                         traceback.print_exc()
             
-            self.opengl_widget = QOpenGLWrapper(self.opengl_renderer)
+            self.opengl_widget = QOpenGLWrapper(self.opengl_renderer, self.mesh_system)
             layout.addWidget(self.opengl_widget)
             
             return panel

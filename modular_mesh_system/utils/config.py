@@ -42,7 +42,7 @@ class Config:
     DEPTH_NORMALIZE_RANGE = True  # 是否将深度值归一化到[0,1]范围
     
     # 边界参数
-    size_factor = 0.8
+    size_factor = 4
     BOUNDARY_MIN = np.array([-1.0 * size_factor, -1.0 * size_factor, -1.0 * size_factor], dtype=np.float64)
     BOUNDARY_MAX = np.array([1.0 * size_factor, 1.0 * size_factor, 1.0 * size_factor], dtype=np.float64)
     

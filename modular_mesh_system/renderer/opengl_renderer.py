@@ -132,6 +132,12 @@ class OpenGLRenderer:
         self.light_pos = CONFIG.LIGHT_POSITION.copy()
         self.light_target = CONFIG.LIGHT_TARGET.copy()
 
+        # 深度缓冲暴露相关
+        self.expose_depth_buffer = False  # 是否暴露深度缓冲用于反投影
+        self.depth_exposure_callback = None  # 深度数据回调函数
+        self.last_depth_data = None  # 缓存的深度数据
+        self.depth_exposure_format = 'numpy'  # 暴露格式: 'numpy', 'texture', 'both'
+
     def initialize(self, ctx):
         """Initialize OpenGL context and shaders"""
         self.ctx = ctx
@@ -1086,6 +1092,7 @@ class OpenGLRenderer:
         self._ensure_ssfr_targets(width, height)
         self._ensure_shadow_targets(width, height)
         self.use_colored_particles  = True
+        self._immediate_depth_exposure = True  # 控制是否立即暴露原始深度
         near, far = 0.1, 100.0
         projection = create_perspective_matrix(60.0, width / height, near, far)
         cam_pos = calculate_camera_position(self.camera_distance, self.camera_angle_x, self.camera_angle_y, self.camera_target)
@@ -1102,9 +1109,11 @@ class OpenGLRenderer:
 
         self.depth_fbo0.use()
         self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
-        self.ctx.clear(0.0, 0.0, 0.0, 0.0)
+        # 清除深度为远平面(1.0)，颜色为黑色
+        self.ctx.clear(0.0, 0.0, 0.0, 0.0, depth=1.0)
 
-        if self.particle_count > 0:
+        # ★ 修改：即使没有粒子也执行深度pass，确保纹理被正确初始化
+        if self.particle_count > 0 and self.particle_vao_depth is not None:
             p = self.particle_depth_prog
             p['projection'].write(projection.tobytes())
             p['view'].write(view.tobytes())
@@ -1112,6 +1121,16 @@ class OpenGLRenderer:
             p['u_viewport_h'].value = float(self._ssfr_h)
             p['u_point_scale'].value = 1.0
             self.particle_vao_depth.render(mode=moderngl.POINTS, vertices=self.particle_count)
+            print(f"✓ 渲染了 {self.particle_count} 个粒子的深度")
+        else:
+            print(f"⚠ 深度pass: 粒子数量为 {self.particle_count}，仅执行清屏操作")
+
+        # ★ 新增：立即暴露原始深度数据（如果需要）
+        if (self.expose_depth_buffer and 
+            hasattr(self, '_immediate_depth_exposure') and 
+            self._immediate_depth_exposure):
+            print("★ 执行即时深度暴露...")
+            self._expose_depth_for_projection(self.depth_tex0)
 
         # Pass 1.5 - Colored Particles (新增：独立的颜色渲染pass)
         if (hasattr(self, 'use_colored_particles') and 
@@ -1156,6 +1175,11 @@ class OpenGLRenderer:
             self._save_depth_texture("depth_tex0")
             self.last_depth_save_time = current_time
             self.depth_frame_counter += 1
+
+        # ★ 新增：暴露深度缓冲用于反投影
+        if self.expose_depth_buffer:
+            print("★ 执行最终深度暴露...")
+            self._expose_depth_for_projection(final_depth_tex)
 
         # Pass 3 - Thickness
         self.thick_fbo.use()
@@ -1204,6 +1228,12 @@ class OpenGLRenderer:
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
         self.ctx.clear(0.06, 0.08, 0.12, 1.0)
+
+        # ★ 新增：在复合渲染前也可以暴露深度（如果需要原始深度）
+        if (self.expose_depth_buffer and 
+            hasattr(self, 'depth_tex0') and 
+            self.depth_tex0 is not None):
+            self._expose_depth_for_projection(self.depth_tex0)
 
         cp = self.composite_prog
 
@@ -1459,3 +1489,119 @@ class OpenGLRenderer:
         except Exception as e:
             print(f"✗ 保存NPY失败: {e}")
             raise
+
+    def enable_depth_exposure(self, callback=None, format='numpy'):
+        """启用深度缓冲暴露用于反投影
+        
+        Args:
+            callback: 可选的回调函数，接收深度数据作为参数
+            format: 暴露格式 ('numpy', 'texture', 'both')
+        """
+        self.expose_depth_buffer = True
+        self.depth_exposure_callback = callback
+        self.depth_exposure_format = format
+        print("✓ 深度缓冲暴露已启用")
+        
+    def disable_depth_exposure(self):
+        """禁用深度缓冲暴露"""
+        self.expose_depth_buffer = False
+        self.depth_exposure_callback = None
+        print("✓ 深度缓冲暴露已禁用")
+        
+    def get_exposed_depth_data(self):
+        """获取最近一次暴露的深度数据
+        
+        Returns:
+            dict: 包含'data'(numpy数组)和'texture'(ModernGL纹理对象)的字典
+        """
+        if not self.expose_depth_buffer:
+            return None
+            
+        result = {}
+        
+        # 返回numpy数据
+        if self.depth_exposure_format in ['numpy', 'both'] and self.last_depth_data is not None:
+            result['data'] = self.last_depth_data.copy()
+            
+        # 返回纹理对象
+        if self.depth_exposure_format in ['texture', 'both']:
+            # TODO: 这里可以返回深度纹理引用
+            # 注意：直接返回纹理对象需要小心生命周期管理
+            pass
+        return result if result else None
+        
+    def _expose_depth_for_projection(self, depth_texture):
+        """将深度数据暴露给外部用于反投影计算
+        
+        Args:
+            depth_texture: 要暴露的深度纹理对象
+        """
+        if not self.expose_depth_buffer:
+            return
+            
+        try:
+            # 检查纹理是否有效
+            if depth_texture is None:
+                print("✗ 深度纹理为空，无法暴露")
+                return
+                
+            # 从GPU读取深度数据
+            width, height = depth_texture.size
+            if width <= 0 or height <= 0:
+                print("✗ 深度纹理尺寸无效")
+                return
+                
+            temp_fbo = self.ctx.framebuffer(color_attachments=[depth_texture])
+            
+            # 读取浮点深度数据
+            depth_bytes = temp_fbo.read(
+                viewport=(0, 0, width, height),
+                components=1,
+                dtype='f4'
+            )
+            
+            # 转换为numpy数组
+            import numpy as np
+            depth_data = np.frombuffer(depth_bytes, dtype=np.float32)
+            depth_data = depth_data.reshape((height, width))
+            
+            # 检查数据有效性
+            data_min = np.min(depth_data)
+            data_max = np.max(depth_data)
+            data_mean = np.mean(depth_data)
+            
+            # 如果所有数据都是0，记录详细信息
+            if data_max == 0.0:
+                print(f"⚠ 深度数据全为0! 纹理尺寸: {width}x{height}")
+                print(f"  粒子数量: {self.particle_count}")
+                print(f"  粒子颜色数据: {self.particle_colors is not None if hasattr(self, 'particle_colors') else 'N/A'}")
+                print(f"  粒子VBO状态: {self.particle_vbo is not None}")
+                print(f"  深度VAO状态: {self.particle_vao_depth is not None}")
+                print(f"  深度程序状态: {self.particle_depth_prog is not None}")
+            else:
+                print(f"✓ 深度数据已暴露: {width}x{height}, 范围 [{data_min:.6f}, {data_max:.6f}], 平均值 {data_mean:.6f}")
+            
+            # 缓存数据
+            self.last_depth_data = depth_data
+            
+            # 调用回调函数
+            if self.depth_exposure_callback:
+                try:
+                    callback_data = {
+                        'data': depth_data,
+                        'shape': (height, width),
+                        'range': (data_min, data_max),
+                        'mean': data_mean,
+                        'particle_count': self.particle_count
+                    }
+                    self.depth_exposure_callback(callback_data)
+                except Exception as e:
+                    print(f"✗ 深度回调执行失败: {e}")
+            
+            # 释放临时资源
+            temp_fbo.release()
+            
+        except Exception as e:
+            print(f"✗ 深度暴露失败: {e}")
+            import traceback
+            traceback.print_exc()
