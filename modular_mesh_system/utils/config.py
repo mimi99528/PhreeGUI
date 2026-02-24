@@ -11,6 +11,7 @@ class Config:
     # 物理仿真参数
     PARTICLE_RADIUS = 0.05
     MAX_PARTICLES = 30000
+    MAX_EMITTER_PARTICLES = 5000  # 预留给运行时动态添加粒子的空间
     H = PARTICLE_RADIUS * 2.0
     
     # 网格参数
