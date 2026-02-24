@@ -114,6 +114,11 @@ class OpenGLRenderer:
         self.depth_fbo1 = None
         self.thick_fbo = None
 
+        # Color texture/FBO for PH overlay
+        self.color_tex = None
+        self.color_fbo = None
+        self.use_colored_particles = False
+
         # Shadow mapping
         self.shadow_scale = 1.0
         self.shadow_w = 0
@@ -425,6 +430,7 @@ class OpenGLRenderer:
         uniform sampler2D u_depth;
         uniform sampler2D u_thick;
         uniform sampler2D u_shadow;
+        uniform sampler2D u_color;
         uniform vec2 u_texel;
         uniform vec2 u_shadow_texel;
         uniform float u_proj_x;
@@ -566,6 +572,12 @@ class OpenGLRenderer:
             caustic = min(caustic, 0.4);
             color += caustic * vec3(1.0, 0.96, 0.82) * shad;
 
+            // Blend PH color overlay (skip near-transparent texels)
+            vec4 ph_color = texture(u_color, v_uv);
+            if (ph_color.a > 0.01) {  // 0.01: discard negligible contributions
+                color = mix(color, ph_color.rgb, ph_color.a * 0.6);  // 0.6: tint strength, keeps fluid look
+            }
+
             float alpha = clamp(u_alpha_base + (1.0 - trans) * 0.85 + fresnel * 0.25, 0.05, 0.98);
 
             frag_color = vec4(color, alpha);
@@ -674,7 +686,10 @@ class OpenGLRenderer:
     def _ensure_ssfr_targets(self, width: int, height: int):
         w = max(1, int(width * self.ssfr_scale))
         h = max(1, int(height * self.ssfr_scale))
-        if w == self._ssfr_w and h == self._ssfr_h and getattr(self, "depth_fbo0", None) is not None:
+        size_unchanged = (w == self._ssfr_w and h == self._ssfr_h)
+        targets_exist = (getattr(self, "depth_fbo0", None) is not None
+                         and getattr(self, "color_fbo", None) is not None)
+        if size_unchanged and targets_exist:
             return
 
         self._ssfr_w, self._ssfr_h = w, h
@@ -684,9 +699,11 @@ class OpenGLRenderer:
             getattr(self, "depth_fbo0", None),
             getattr(self, "depth_fbo1", None),
             getattr(self, "thick_fbo", None),
+            getattr(self, "color_fbo", None),
             getattr(self, "depth_tex0", None),
             getattr(self, "depth_tex1", None),
             getattr(self, "thick_tex", None),
+            getattr(self, "color_tex", None),
             getattr(self, "_depth_rb0", None),
             getattr(self, "_depth_rb1", None),
         ):
@@ -710,12 +727,17 @@ class OpenGLRenderer:
         self.thick_tex = self.ctx.texture((w, h), components=1, dtype='f2')
         self.thick_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
+        # Color texture for PH overlay
+        self.color_tex = self.ctx.texture((w, h), components=4, dtype='f1')
+        self.color_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
         # FBOs
         self.depth_fbo0 = self.ctx.framebuffer(
             color_attachments=[self.depth_tex0], depth_attachment=self._depth_rb0)
         self.depth_fbo1 = self.ctx.framebuffer(
             color_attachments=[self.depth_tex1], depth_attachment=self._depth_rb1)
         self.thick_fbo = self.ctx.framebuffer(color_attachments=[self.thick_tex])
+        self.color_fbo = self.ctx.framebuffer(color_attachments=[self.color_tex])
 
     def _ensure_shadow_targets(self, width: int, height: int):
         w = CONFIG.SHADOW_MAP_SIZE
@@ -1010,7 +1032,6 @@ class OpenGLRenderer:
     def _render_ssfr(self, width: int, height: int, screen_fbo):
         self._ensure_ssfr_targets(width, height)
         self._ensure_shadow_targets(width, height)
-        self.use_colored_particles  = True
         near, far = 0.1, 100.0
         projection = create_perspective_matrix(60.0, width / height, near, far)
         cam_pos = calculate_camera_position(self.camera_distance, self.camera_angle_x, self.camera_angle_y, self.camera_target)
@@ -1038,33 +1059,26 @@ class OpenGLRenderer:
             p['u_point_scale'].value = 1.0
             self.particle_vao_depth.render(mode=moderngl.POINTS, vertices=self.particle_count)
 
-        # Pass 1.5 - Colored Particles (新增：颜色可视化层)
-        # 注意：这里不返回，继续执行完整的SSFR流程
-        color_particles_rendered = False
-        if hasattr(self, 'use_colored_particles') and self.use_colored_particles and self.particle_count > 0:
-            # 启用混合进行颜色叠加
-            self.ctx.enable(moderngl.BLEND)
-            self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-            # 确保有颜色数据
-            if self.particle_colors is not None and len(self.particle_colors) >= self.particle_count:
-                # 渲染带颜色的粒子作为可视化层
-                p = self.particle_color_prog
-                p['projection'].write(projection.tobytes())
-                p['view'].write(view.tobytes())
-                p['u_particle_radius_world'].value = r_world
-                p['u_viewport_h'].value = float(self._ssfr_h)
-                p['u_point_scale'].value = 1.0
-                self.particle_vao_colored.render(mode=moderngl.POINTS, vertices=self.particle_count)
+        # Pass 1.5 - Color (render PH particle colors into dedicated color FBO)
+        self.color_fbo.use()
+        self.ctx.viewport = (0, 0, self._ssfr_w, self._ssfr_h)
+        self.ctx.clear(0.0, 0.0, 0.0, 0.0)
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
-                color_particles_rendered = True
-                print(f"✓ 渲染了 {self.particle_count} 个彩色粒子")
-            else:
-                print("⚠ 缺少粒子颜色数据，跳过彩色渲染")
-            
-            # 重要：不清除深度测试，继续执行后续步骤
-            # 但保持混合模式开启以便颜色能够显示
-            self.ctx.disable(moderngl.BLEND)  # 注释掉这行，保持混合开启
+        if (self.use_colored_particles and self.particle_count > 0
+                and self.particle_colors is not None
+                and len(self.particle_colors) >= self.particle_count):
+            p = self.particle_color_prog
+            p['projection'].write(projection.tobytes())
+            p['view'].write(view.tobytes())
+            p['u_particle_radius_world'].value = r_world
+            p['u_viewport_h'].value = float(self._ssfr_h)
+            p['u_point_scale'].value = 1.0
+            self.particle_vao_colored.render(mode=moderngl.POINTS, vertices=self.particle_count)
 
+        self.ctx.disable(moderngl.BLEND)
 
         # Pass 2 - Bilateral filtering with clean ping-pong logic
         self.ctx.disable(moderngl.DEPTH_TEST)
@@ -1152,9 +1166,11 @@ class OpenGLRenderer:
         final_depth_tex.use(location=0)
         self.thick_tex.use(location=1)
         self.shadow_tex.use(location=2)
+        self.color_tex.use(location=3)
         cp['u_depth'].value = 0
         cp['u_thick'].value = 1
         cp['u_shadow'].value = 2
+        cp['u_color'].value = 3
 
         self.quad_vao_comp.render(moderngl.TRIANGLES, vertices=6)
 
@@ -1190,8 +1206,8 @@ class OpenGLRenderer:
         """Clean up OpenGL resources"""
         resources = [
             'vao', 'vertex_buffer', 'index_buffer', 'prog',
-            'depth_fbo0', 'depth_fbo1', 'thick_fbo',
-            'depth_tex0', 'depth_tex1', 'thick_tex',
+            'depth_fbo0', 'depth_fbo1', 'thick_fbo', 'color_fbo',
+            'depth_tex0', 'depth_tex1', 'thick_tex', 'color_tex',
             'particle_vao_depth', 'particle_vao_thick',
             'particle_depth_prog', 'particle_thick_prog',
             'bilateral_prog', 'quad_vao_bilateral', 'quad_vao_comp'
