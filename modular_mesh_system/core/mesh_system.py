@@ -602,18 +602,21 @@ class MeshSystem:
                 n_to_add = min(n_new, available)
                 positions_to_add = np.asarray(positions[:n_to_add], dtype=np.float64)
 
-                # 直接向FluidModel写入粒子数据并激活
+                # 1. 写入粒子位置和速度
                 for i in range(n_to_add):
                     idx = current_active + i
                     fm.setPosition(idx, positions_to_add[i].tolist())
                     fm.setVelocity(idx, [0.0, 0.0, 0.0])
 
+                # 2. 更新活跃粒子计数
                 fm.setNumActiveParticles(current_active + n_to_add)
 
-                # 参数为 (fluid_model, startIndex)
-                self.pysplish_simulation.emittedParticles(fm, current_active + n_to_add)
+                # 3. 关键补丁 A：初始化解算器缓冲区（j 从 current_active 开始）
+                # 注意：第二个参数必须是新粒子开始的索引！
+                self.pysplish_simulation.emittedParticles(fm, current_active)
 
-                # 更新邻居搜索，使新粒子参与物理计算
+                print(f"Adding {n_to_add} particles. New total: {current_active + n_to_add}, Capacity: {fm.numParticles()}")
+                # 5. 执行邻域搜索
                 self.pysplish_simulation.performNeighborhoodSearch()
 
                 # 同步PySPlisHSPlasH数据到本地缓冲区
