@@ -1063,7 +1063,7 @@ class OpenGLRenderer:
             
             # 重要：不清除深度测试，继续执行后续步骤
             # 但保持混合模式开启以便颜色能够显示
-            self.ctx.disable(moderngl.BLEND)  # 注释掉这行，保持混合开启
+            # self.ctx.disable(moderngl.BLEND)  # 注释掉这行，保持混合开启
 
 
         # Pass 2 - Bilateral filtering with clean ping-pong logic

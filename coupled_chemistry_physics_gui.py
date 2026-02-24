@@ -396,10 +396,13 @@ class SimulationWorker(QObject):
                 
                 # 获取并发送pH数据用于颜色渲染
                 if hasattr(self.coupled_sim, 'get_particle_ph'):
-                    ph_data = self.coupled_sim.get_particle_ph(0)  # 获取第一个组分作为pH
+                    # 使用SelectedOutput获取pH值
+                    ph_data = self.coupled_sim.get_particle_ph(0)  # 获取H+组分对应的pH
                     if ph_data is not None and ph_data.size > 0:
                         self.ph_data_updated.emit(ph_data)
                         logger.debug(f"发送pH数据，长度: {len(ph_data)}, 范围: [{np.min(ph_data):.3f}, {np.max(ph_data):.3f}]")
+                    else:
+                        logger.debug("未能获取有效的pH数据")
                 
                 # 发送仿真状态
                 self.simulation_updated.emit(stats)

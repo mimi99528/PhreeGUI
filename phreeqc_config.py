@@ -263,7 +263,7 @@ def get_chemical_status(rm: PhreeqcRM) -> Dict:
         # 获取pH数据（如果可用）
         try:
             selected_out = rm.GetSelectedOutput()
-            if selected_out and len(selected_out) > 0:
+            if selected_out is not None and len(selected_out) > 0:
                 status['ph_data'] = selected_out[0].get('pH', [])
         except:
             status['ph_data'] = []

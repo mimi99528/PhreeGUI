@@ -556,8 +556,10 @@ class CoupledSimulation:
         调用 PHREEQCRM 执行化学反应，含自动减半 dt 重试机制。
     
         修改说明：
-        1. 只将active cell的浓度依次排布在浓度列表中
-        2. 返回时按照mapping顺序将浓度映射回完整网格
+        1. 始终构建完整的 nxyz × ncomps 浓度数组传给 SetConcentrations
+        2. 用 CreateMappingSWIG 标记非活跃单元为 -1
+        3. 非活跃单元填入合理的背景值（纯水浓度），避免 H/O 为零
+        4. 从 GetConcentrations 解析返回值时，按完整 nxyz × ncomps 处理
     
         Args:
             cell_conc: (n_cells, n_comps) 输入浓度矩阵
@@ -573,148 +575,77 @@ class CoupledSimulation:
         n_cells = self.chem_field.n_cells
     
         # ── 识别活跃单元 ──
-        background_threshold = 1e-9  # 比背景浓度高一个数量级的阈值
-        pure_water_threshold = 55.342085488  # 纯水浓度阈值
-        water_tolerance = 0.1  # 水浓度容差
-        
-        # 识别显著浓度的单元：检查除了前三个组分（H, O, Charge）外的其他组分
-        # 假设前三个组分索引为 0, 1, 2
-        major_components = [0, 1, 2]  # H, O, Charge 的索引
+        major_components = [0, 1, 2]  # H, O, Charge
         other_comps_indices = [i for i in range(self.n_comps) if i not in major_components]
         
-        # 如果存在其他组分，检查它们是否严格为零
+        # 检查哪些单元有粒子且不是纯水
         if other_comps_indices:
             other_comps_zero = np.all(cell_conc[:, other_comps_indices] == 0.0, axis=1)
-            # 标记纯水单元：其他组分严格为零
-            pure_water_cells = other_comps_zero
-            # 从显著单元中排除纯水单元
-            significant_cells_mask = np.any(cell_conc > background_threshold, axis=1) & ~pure_water_cells
-            
-            n_pure_water = int(np.sum(pure_water_cells))
-            if n_pure_water > 0:
-                _chem_logger.info(f"Frame {self.frame_count}: 识别到 {n_pure_water} 个纯水单元（其他组分严格为零），将其标记为非活跃")
+            has_particles = np.array([len(self.chem_field.cell_particles[i]) > 0 for i in range(n_cells)])
+            significant_cells_mask = has_particles & ~other_comps_zero
         else:
-            # 如果没有其他组分，直接使用背景阈值判断
-            significant_cells_mask = np.any(cell_conc > background_threshold, axis=1)
-        n_significant = int(np.sum(significant_cells_mask))
+            significant_cells_mask = np.any(cell_conc > 1e-9, axis=1)
             
+        n_significant = int(np.sum(significant_cells_mask))
         if n_significant == 0:
-            _chem_logger.info(
-                f"Frame {self.frame_count}: 没有显著浓度的化学单元，跳过化学计算"
-            )
+            _chem_logger.info(f"Frame {self.frame_count}: 没有显著浓度的化学单元，跳过化学计算")
             return cell_conc.copy()
     
-        # 创建活跃单元映射
-        # active_cell_indices = np.where(significant_cells_mask)[0]
-        # inactive_cell_indices = np.where(~significant_cells_mask)[0]
-        #
-        # 构建mapping：活跃单元按顺序映射到0,1,2...，非活跃单元映射为-1
-        # mapping = [-1] * n_cells
-        # for i, active_idx in enumerate(active_cell_indices):
-        #     mapping[active_idx] = i
-        #
-        # try:
-        #     self.rm.CreateMapping(mapping)
-        #     _chem_logger.debug(
-        #         f"Frame {self.frame_count}: 映射创建完成，{n_significant}/{n_cells} 个活跃单元"
-        #     )
-        # except Exception as e:
-        #     _chem_logger.warning(f"Frame {self.frame_count}: CreateMapping 失败: {e}")
-        #     return cell_conc.copy()
-    
-        # ── 构造活性单元浓度列表 ──
-        # 只提取活跃单元的浓度，按活跃单元顺序排列
-        active_cell_indices = [-1] * n_cells
-        active_counter = 0
-        for i, is_significant in enumerate(significant_cells_mask):
-            if is_significant:
-                active_cell_indices[i] = active_counter
-                active_counter += 1
-        
-        # 提取活跃单元的浓度数据
-        active_cell_conc = cell_conc[significant_cells_mask]  # (n_active, n_comps)
-        conc_flat_active = active_cell_conc.T.flatten().copy()
-        print("conc_flat_active:", conc_flat_active)
-        _chem_logger.debug(f"Frame {self.frame_count}: 活跃单元浓度列表长度: {len(conc_flat_active)}, 活跃单元数: {n_significant}")
-        
-        # 添加调试信息：显示活跃单元的原始浓度范围
-        if len(active_cell_conc) > 0:
-            _chem_logger.debug(f"Frame {self.frame_count}: 活跃单元原始浓度范围: [{np.min(active_cell_conc):.2e}, {np.max(active_cell_conc):.2e}]")
-            # 检查是否有异常高的浓度值
-            high_conc_mask = active_cell_conc > 1.0  # 大于1 mol/L的浓度
-            if np.any(high_conc_mask):
-                high_conc_count = np.sum(high_conc_mask)
-                _chem_logger.warning(f"Frame {self.frame_count}: 检测到 {high_conc_count} 个超过1 mol/L的浓度值")
-        #
-        # # 处理特殊情况：H2O为0的单元
-        # # 注意：已移除可能导致H和O异常高浓度的硬编码值
-        # active_inactives = [False] * len(active_cell_indices)  # 只标记活跃单元中的inactive
-        # if self.n_comps > 0 and len(conc_flat_active) > 0:
-        #     # 使用合理的默认浓度（mol/L）
-        #     initial_concentrations = {
-        #         'OH-': 1.006e-07,
-        #         'H+': 1.006e-07,
-        #         'H': 1.433e-25,      # 极低的氢原子浓度
-        #         'O': 0.000e+00,      # 零氧原子浓度
-        #         'H2O': 1.000e-06,    # 极低的水浓度
-        #         'H2': 7.166e-26,
-        #         'O2': 0.000e+00,
-        #         'Charge': 0.000e+00
-        #     }
-        #
-        #     # 检查H2O组分
-        #     h2o_comp_index = None
-        #     if 'H2O' in self.comp_names:
-        #         h2o_comp_index = self.comp_names.index('H2O')
-        #
-        #     if h2o_comp_index is not None:
-        #         # 获取活跃单元中H2O的浓度（注意这里是按活跃单元顺序排列的）
-        #         h2o_conc_in_active = conc_flat_active[h2o_comp_index::self.n_comps]
-        #         zero_h2o_mask = np.isclose(h2o_conc_in_active, 0.0)
-        #         n_zero_h2o_active = np.sum(zero_h2o_mask)
-        #
-        #         if n_zero_h2o_active > 0:
-        #             _chem_logger.info(f"Frame {self.frame_count}: 检测到 {n_zero_h2o_active} 个活跃单元的H2O为0")
-        #
-        #             # 标记这些活跃单元为inactive
-        #             zero_h2o_active_indices = np.where(zero_h2o_mask)[0]
-        #             for active_local_idx in zero_h2o_active_indices:
-        #                 print(f"  活跃单元索引 {active_local_idx} 被标记为 inactive")
-        #                 active_inactives[active_local_idx] = True
-        #
-        #                 # 替换该活跃单元的所有组分浓度
-        #                 cell_start = active_local_idx * self.n_comps
-        #                 cell_end = cell_start + self.n_comps
-        #
-        #                 for i, comp_name in enumerate(self.comp_names):
-        #                     if comp_name in initial_concentrations:
-        #                         conc_flat_active[cell_start + i] = initial_concentrations[comp_name]
-        #                     else:
-        #                         conc_flat_active[cell_start + i] = 0.0
-        #
-        #                 _chem_logger.debug(f"Frame {self.frame_count}: 替换了活跃单元 {active_local_idx} 的浓度")
-            
-        # 设置时间和其他参数
-        self.rm.SetTime(self.accumulated_chem_dt)
-            
-        # 创建SWIG映射（处理inactive单元）
-        # SWIG映射只需要针对活跃单元，inactive的活跃单元标记为-1
+        # ── 创建映射 ──
         swig_mapping = [-1] * n_cells
         c = 0
-        for i, b in enumerate(significant_cells_mask):
-            if b:
+        for i in range(n_cells):
+            if significant_cells_mask[i]:
                 swig_mapping[i] = c
                 c += 1
-        print([float(i) for i in conc_flat_active])
-        print("swig_mapping:", swig_mapping)
-            
+        
         try:
             self.rm.CreateMappingSWIG(swig_mapping)
         except Exception as e:
             _chem_logger.warning(f"Frame {self.frame_count}: CreateMappingSWIG 失败: {e}")
             return cell_conc.copy()
+
+        # ──【关键修复】构建完整的 nxyz × ncomps 浓度数组 ──
+        # 非活跃单元填入缓存的初始平衡浓度（纯水值），避免 H/O 为零
+        full_conc = cell_conc.copy()  # (n_cells, n_comps)
+
+        # 对没有粒子的空单元，填入合理的纯水背景浓度
+        if self._initial_equilibrium_conc is not None:
+            # 用初始化时缓存的平衡浓度中的"纯水"行作为背景
+            # 找一个纯水单元的浓度作为模板
+            pure_water_row = None
+            if hasattr(self, 'pure_water_cells') and np.any(self.pure_water_cells):
+                first_pw_idx = np.where(self.pure_water_cells)[0][0]
+                pure_water_row = self._initial_equilibrium_conc[first_pw_idx]
+
+            if pure_water_row is not None:
+                for i in range(n_cells):
+                    if not significant_cells_mask[i]:
+                        full_conc[i] = pure_water_row
+        else:
+            # 没有缓存，手动设置纯水浓度
+            for i in range(n_cells):
+                if not significant_cells_mask[i]:
+                    # H ≈ 110.68, O ≈ 55.35, Charge ≈ 0, 其他 = 0
+                    if self.n_comps >= 3:
+                        full_conc[i, 0] = 110.68  # H
+                        full_conc[i, 1] = 55.35   # O
+                        full_conc[i, 2] = 0.0     # Charge
+
+        # SetConcentrations 要求 component-major 布局:
+        # [comp0_cell0, comp0_cell1, ..., comp0_cellN, comp1_cell0, ...]
+        # 即 (n_comps, n_cells) 展平
+        conc_flat_full = full_conc.T.flatten().tolist()  # 长度 = n_comps * n_cells
+        
+        # ── 设置时间参数和物理参数 ──
+        self.rm.SetTime(self.accumulated_chem_dt)
+        self.rm.SetSaturationUser([1.0] * n_cells)
+        self.rm.SetRepresentativeVolume([1.0] * n_cells)
+        self.rm.SetPorosity([0.2] * n_cells)
+        self.rm.SetTemperature([25.0] * n_cells)
+        self.rm.SetPressure([1.0] * n_cells)
     
-        # 重试逻辑
+        # ── 重试逻辑 ──
         current_dt = dt
         converged = False
         last_error_msg = ""
@@ -722,8 +653,8 @@ class CoupledSimulation:
         for retry in range(CHEM_MAX_RETRIES):
             self.rm.SetTimeStep(current_dt)
             try:
-                # 设置活跃单元浓度
-                self.rm.SetConcentrations(conc_flat_active.tolist())
+                # 【关键】传入完整数组！
+                self.rm.SetConcentrations(conc_flat_full)
                 status = self.rm.RunCells()
                 if status == 0:
                     converged = True
@@ -753,72 +684,26 @@ class CoupledSimulation:
             )
             return cell_conc.copy()
     
-        # ── 解码返回的浓度并映射回完整网格 ──
-        try:
-            # 获取PHREEQCRM返回的浓度（只包含活跃单元的结果）
-            result_conc_flat = np.array(self.rm.GetConcentrations(), dtype=np.float64)
-                
-            _chem_logger.debug(f"Frame {self.frame_count}: PHREEQCRM返回浓度长度: {len(result_conc_flat)}")
-                
-            # 验证返回长度
-            expected_active_length = active_counter * self.n_comps
-            if len(result_conc_flat) != expected_active_length:
-                _chem_logger.warning(
-                    f"Frame {self.frame_count}: 返回浓度长度不匹配! 期望: {expected_active_length}, 实际: {len(result_conc_flat)}"
-                )
-                return cell_conc.copy()
-                
-            # 创建新的完整网格浓度矩阵
-            new_conc = cell_conc.copy()  # 复制原始浓度作为基础
-                
-            # 将活跃单元的计算结果映射回对应位置
-            result_2d = result_conc_flat.reshape((active_counter, self.n_comps))
-                
-            # 将计算结果映射回活跃单元
-            active_cell_positions = np.where(significant_cells_mask)[0]
-            for i, global_cell_idx in enumerate(active_cell_positions):
-                new_conc[global_cell_idx] = result_2d[i]
-                
-            # 非活跃单元保持原始背景浓度
-            for inactive_idx in inactive_cell_indices:
-                # 保持背景浓度不变
-                pass
-                
-            _chem_logger.debug(f"Frame {self.frame_count}: 成功映射浓度回完整网格")
-            
-            # 添加输出浓度的调试信息
-            if len(new_conc) > 0:
-                _chem_logger.debug(f"Frame {self.frame_count}: 输出浓度范围: [{np.min(new_conc):.2e}, {np.max(new_conc):.2e}]")
-                # 检查是否有异常高的浓度
-                very_high_conc = new_conc[new_conc > 10.0]  # 大于10 mol/L
-                if len(very_high_conc) > 0:
-                    _chem_logger.error(f"Frame {self.frame_count}: 检测到极高浓度值! 最大值: {np.max(very_high_conc):.2e}")
-                
-            # 验证输出浓度的有效性
-            if np.any(np.isnan(new_conc)) or np.any(np.isinf(new_conc)):
-                _chem_logger.warning(
-                    f"Frame {self.frame_count}: 检测到输出浓度包含NaN或Inf值，使用输入浓度"
-                )
-                return cell_conc.copy()
-                
-            # 确保输出浓度为正值
-            new_conc = np.maximum(new_conc, 0.0)
-                    
-        except Exception as e:
-            _chem_logger.error(
-                f"Frame {self.frame_count}: 浓度解码失败: {e}"
-            )
+        # ── 解析返回值（也是完整 nxyz × ncomps） ──
+        result_flat = np.array(self.rm.GetConcentrations(), dtype=np.float64)
+        expected_len = n_cells * self.n_comps
+        if len(result_flat) != expected_len:
+            _chem_logger.warning(f"Frame {self.frame_count}: 返回长度不匹配: 期望 {expected_len}, 实际 {len(result_flat)}")
             return cell_conc.copy()
-    
-        # 负浓度截断 + 告警日志
-        neg_mask = new_conc < 0.0
-        if neg_mask.any():
-            n_neg = int(neg_mask.sum())
-            _chem_logger.warning(
-                f"Frame {self.frame_count}: {n_neg} 个负浓度值检测到，截断为0"
-            )
-            np.clip(new_conc, 0.0, None, out=new_conc)
-    
+
+        # GetConcentrations 也是 component-major 布局
+        new_conc = result_flat.reshape((self.n_comps, n_cells)).T  # (n_cells, n_comps)
+
+        # 非活跃单元的值被 PHREEQCRM 设为 1e30，还原为原始值
+        for i in range(n_cells):
+            if not significant_cells_mask[i]:
+                new_conc[i] = cell_conc[i]
+
+        # 负浓度截断
+        np.clip(new_conc, 0.0, None, out=new_conc)
+        
+        _chem_logger.debug(f"Frame {self.frame_count}: 化学步执行完成，输出浓度范围: [{np.min(new_conc):.2e}, {np.max(new_conc):.2e}]")
+        
         return new_conc
 
     # ------------------------------------------------------------------
@@ -847,6 +732,48 @@ class CoupledSimulation:
         else:
             print("[CoupledSim] 粒子溶液数组为空")
 
+    def _calculate_ph_from_concentrations(self, h_index: int = 0) -> Optional[np.ndarray]:
+        """
+        从粒子浓度数据计算pH值（回退方案）
+        
+        Args:
+            h_index: H+组分的索引
+            
+        Returns:
+            ph_array: (n_active_particles,) float64 数组，或None
+        """
+        if self._particle_solutions is None:
+            return None
+            
+        n_active_particles = (
+            self.mesh_system.current_particle_num
+            if self.mesh_system is not None
+            else (
+                len(self._particle_cell_ids)
+                if self._particle_cell_ids is not None
+                else 0
+            )
+        )
+        
+        if n_active_particles == 0:
+            return None
+            
+        # 确保H+索引有效
+        if h_index >= self.n_comps:
+            # 尝试查找H+组分
+            if 'H+' in self.comp_names:
+                h_index = self.comp_names.index('H+')
+            else:
+                h_index = 0  # 默认使用第一个组分
+        
+        # 从粒子溶液中提取H+浓度并计算pH
+        h_concentrations = self._particle_solutions[:n_active_particles, h_index]
+        # pH = -log10[H+]，注意浓度单位转换
+        ph_values = -np.log10(np.maximum(h_concentrations, 1e-14))  # 避免log(0)
+        
+        _chem_logger.debug(f"通过浓度计算得到 {n_active_particles} 个粒子的pH值，范围: [{np.min(ph_values):.2f}, {np.max(ph_values):.2f}]")
+        return ph_values
+
 
     # ------------------------------------------------------------------
     # 粒子化学状态访问
@@ -854,15 +781,78 @@ class CoupledSimulation:
 
     def get_particle_ph(self, ph_component_index: int = 0) -> Optional[np.ndarray]:
         """
-        获取每个粒子的 pH（或指定组分浓度）。
+        使用PHREEQCRM的SelectedOutput获取每个粒子的pH值。
 
         Args:
-            ph_component_index: 对应 pH 的组分索引（默认 0）
+            ph_component_index: 对应pH的组分索引（默认0，通常是H+）
 
         Returns:
-            ph_array: (n_active_particles,) float64 数组，或 None
+            ph_array: (n_active_particles,) float64 数组，或None
         """
-        return self.rm.GetSelectedOutput()
+        if self.rm is None or self._particle_solutions is None:
+            return None
+            
+        try:
+            # 使用SelectedOutput获取pH值
+            # PHREEQCRM的SelectedOutput返回的是cell级别的数据（numpy数组格式）
+            selected_output = self.rm.GetSelectedOutput()
+            
+            if selected_output is not None and selected_output.size > 0:
+                # selected_output已经是numpy数组格式
+                if not isinstance(selected_output, np.ndarray):
+                    selected_output = np.array(selected_output, dtype=np.float64)
+                
+                # 验证SelectedOutput的长度是否匹配化学单元数
+                expected_length = self.chem_field.n_cells
+                if len(selected_output) != expected_length:
+                    _chem_logger.warning(f"SelectedOutput长度({len(selected_output)})与化学单元数({expected_length})不匹配")
+                    # 尝试截断或填充到正确长度
+                    if len(selected_output) > expected_length:
+                        selected_output = selected_output[:expected_length]
+                    else:
+                        padded = np.full(expected_length, 7.0, dtype=np.float64)
+                        padded[:len(selected_output)] = selected_output
+                        selected_output = padded
+                
+                # 获取当前活跃粒子数
+                n_active_particles = (
+                    self.mesh_system.current_particle_num
+                    if self.mesh_system is not None
+                    else (
+                        len(self._particle_cell_ids)
+                        if self._particle_cell_ids is not None
+                        else 0
+                    )
+                )
+                
+                if n_active_particles > 0:
+                    # 创建pH数组
+                    ph_values = np.zeros(n_active_particles, dtype=np.float64)
+                    
+                    # 根据粒子所在的化学单元获取对应的pH值
+                    for i in range(n_active_particles):
+                        if self._particle_cell_ids is not None and i < len(self._particle_cell_ids):
+                            cell_id = self._particle_cell_ids[i]
+                            if 0 <= cell_id < len(selected_output):
+                                # 从SelectedOutput获取该单元的pH值
+                                ph_values[i] = selected_output[cell_id]
+                            else:
+                                # 如果无法获取，使用默认pH值7.0
+                                ph_values[i] = 7.0
+                        else:
+                            # 默认pH值
+                            ph_values[i] = 7.0
+                    
+                    _chem_logger.debug(f"成功获取 {n_active_particles} 个粒子的pH值，范围: [{np.min(ph_values):.2f}, {np.max(ph_values):.2f}]")
+                    return ph_values
+            
+            # 如果SelectedOutput不可用，回退到使用粒子溶液数据计算pH
+            return self._calculate_ph_from_concentrations(ph_component_index)
+            
+        except Exception as e:
+            _chem_logger.warning(f"获取pH值失败: {e}")
+            # 回退方案：使用粒子溶液数据计算pH
+            return self._calculate_ph_from_concentrations(ph_component_index)
 
     def get_cell_concentrations(self) -> np.ndarray:
         """
