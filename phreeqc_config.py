@@ -129,7 +129,7 @@ def setup_default_chemical_system(rm: PhreeqcRM) -> bool:
         bool: 是否成功设置
     """
     # 1. 必须在 FindComponents 之前设置！
-    rm.SetComponentH2O(False)
+    # rm.SetComponentH2O(False)
     try:
         # 定义简化的化学系统（使用mol/L单位，避免水组分计算）
         input_string = """
@@ -221,7 +221,7 @@ def initialize_grid_distribution(rm: PhreeqcRM, nx: int = DEFAULT_NX,
         rm.SetPorosity([0.3] * nxyz)
         rm.SetSaturationUser([1.0] * nxyz)
         rm.SetRepresentativeVolume([1.0] * nxyz)
-        rm.SetComponentH2O(False)
+        # rm.SetComponentH2O(False)
 
         # 创建映射
         grid2chem = list(range(nxyz))

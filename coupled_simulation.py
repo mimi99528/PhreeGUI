@@ -232,21 +232,18 @@ class CoupledSimulation:
                                         
                         # 识别并标记纯水单元
                         h2o_comp_index = None
-                        if 'H2O' in self.comp_names:
-                            h2o_comp_index = self.comp_names.index('H2O')
-                                        
-                        if h2o_comp_index is not None:
-                            pure_water_threshold = 55.342085488
-                            water_tolerance = 0.001
-                            h2o_concentrations = cell_conc[:, h2o_comp_index]
-                            pure_water_mask = np.abs(h2o_concentrations - pure_water_threshold) < water_tolerance
-                                            
-                            # 检查其他组分是否都很低
-                            other_comps_indices = [i for i in range(self.n_comps) if i != h2o_comp_index]
+                        # 识别纯水单元：除了H, O, Charge（前三个元素）外都为0
+                        if self.n_comps >= 3:
+                            # 前三个组分索引（H, O, Charge）
+                            major_components = [0, 1, 2]
+                            # 其他组分索引
+                            other_comps_indices = [i for i in range(self.n_comps) if i not in major_components]
+
+                            # 检查其他组分是否都为0
                             if other_comps_indices:
-                                other_comps_low = np.all(cell_conc[:, other_comps_indices] < 1e-6, axis=1)
-                                pure_water_cells = pure_water_mask & other_comps_low
-                                n_pure_water = int(np.sum(pure_water_cells))
+                                other_comps_zero = np.all(cell_conc[:, other_comps_indices] == 0, axis=1)
+                                self.pure_water_cells =  other_comps_zero
+                                n_pure_water = int(np.sum(self.pure_water_cells))
                                 if n_pure_water > 0:
                                     _chem_logger.info(f"初始化时识别到 {n_pure_water} 个纯水单元")
                         
@@ -580,30 +577,25 @@ class CoupledSimulation:
         pure_water_threshold = 55.342085488  # 纯水浓度阈值
         water_tolerance = 0.1  # 水浓度容差
         
-        # 检查H2O组分索引
-        h2o_comp_index = None
-        if 'H2O' in self.comp_names:
-            h2o_comp_index = self.comp_names.index('H2O')
+        # 识别显著浓度的单元：检查除了前三个组分（H, O, Charge）外的其他组分
+        # 假设前三个组分索引为 0, 1, 2
+        major_components = [0, 1, 2]  # H, O, Charge 的索引
+        other_comps_indices = [i for i in range(self.n_comps) if i not in major_components]
         
-        # 识别显著浓度的单元
-        significant_cells_mask = np.any(cell_conc > background_threshold, axis=1)
-        
-        # 进一步筛选：排除纯水单元
-        if h2o_comp_index is not None:
-            h2o_concentrations = cell_conc[:, h2o_comp_index]
-            # 标记接近纯水浓度的单元为非活跃
-            pure_water_mask = np.abs(h2o_concentrations - pure_water_threshold) < water_tolerance
-            # 同时其他组分浓度都很低的单元才被认为是纯水
-            other_comps_low = np.all(cell_conc[:, [i for i in range(self.n_comps) if i != h2o_comp_index]] < 1e-6, axis=1)
-            pure_water_cells = pure_water_mask & other_comps_low
-            
+        # 如果存在其他组分，检查它们是否严格为零
+        if other_comps_indices:
+            other_comps_zero = np.all(cell_conc[:, other_comps_indices] == 0.0, axis=1)
+            # 标记纯水单元：其他组分严格为零
+            pure_water_cells = other_comps_zero
             # 从显著单元中排除纯水单元
-            significant_cells_mask = significant_cells_mask & ~pure_water_cells
+            significant_cells_mask = np.any(cell_conc > background_threshold, axis=1) & ~pure_water_cells
             
             n_pure_water = int(np.sum(pure_water_cells))
             if n_pure_water > 0:
-                _chem_logger.info(f"Frame {self.frame_count}: 识别到 {n_pure_water} 个纯水单元，将其标记为非活跃")
-        
+                _chem_logger.info(f"Frame {self.frame_count}: 识别到 {n_pure_water} 个纯水单元（其他组分严格为零），将其标记为非活跃")
+        else:
+            # 如果没有其他组分，直接使用背景阈值判断
+            significant_cells_mask = np.any(cell_conc > background_threshold, axis=1)
         n_significant = int(np.sum(significant_cells_mask))
             
         if n_significant == 0:
@@ -942,7 +934,7 @@ class CoupledSimulation:
         _chem_logger.debug(f"Frame {self.frame_count}: 活跃粒子数 = {n_active}")
 
         # ── 化学步（每 chem_step_ratio 帧执行）──
-        if self.frame_count % self.chem_step_ratio == 0 and self.rm is not None and self.frame_count > 1:
+        if self.frame_count % self.chem_step_ratio == 0 and self.rm is not None:
             try:
                 _chem_logger.info(f"Frame {self.frame_count}: 开始执行化学步")
                 
@@ -987,17 +979,17 @@ class CoupledSimulation:
                 _chem_logger.error(traceback.format_exc())
         else:
             _chem_logger.debug(f"Frame {self.frame_count}: 不执行化学步")
-            # 直接获取初始浓度值作为浓度（注意：PHREEQCRM返回component-major布局）
-            concentrations = np.array(self.rm.GetConcentrations(), dtype=np.float64)
-            print(f"原始浓度形状: {concentrations.shape}")
-            print(f"目标形状: ({self.chem_field.n_cells}, {self.n_comps})")
-            
-            # PHREEQCRM返回的是component-major布局：[comp0_cell0, comp0_cell1, ..., comp1_cell0, comp1_cell1, ...]
-            # 需要reshape为(n_comps, n_cells)然后转置得到(n_cells, n_comps)
-            cell_conc = concentrations.reshape((self.n_comps, self.chem_field.n_cells)).T
-            print(f"重塑后形状: {cell_conc.shape}")
-            
-            self._broadcast_to_particles(cell_conc)
+            # # 直接获取初始浓度值作为浓度（注意：PHREEQCRM返回component-major布局）
+            # concentrations = np.array(self.rm.GetConcentrations(), dtype=np.float64)
+            # print(f"原始浓度形状: {concentrations.shape}")
+            # print(f"目标形状: ({self.chem_field.n_cells}, {self.n_comps})")
+            #
+            # # PHREEQCRM返回的是component-major布局：[comp0_cell0, comp0_cell1, ..., comp1_cell0, comp1_cell1, ...]
+            # # 需要reshape为(n_comps, n_cells)然后转置得到(n_cells, n_comps)
+            # cell_conc = concentrations.reshape((self.n_comps, self.chem_field.n_cells)).T
+            # print(f"重塑后形状: {cell_conc.shape}")
+            #
+            # self._broadcast_to_particles(cell_conc)
         return stats
 
     def run(self, n_frames: int) -> List[Dict]:
@@ -1011,7 +1003,7 @@ class CoupledSimulation:
             history: 每帧统计信息列表
         """
         history = []
-        self.rm.SetComponentH2O(False)
+        # self.rm.SetComponentH2O(False)
         for _ in range(n_frames):
             stats = self.step()
             history.append(stats)
