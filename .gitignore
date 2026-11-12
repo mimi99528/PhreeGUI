@@ -30,3 +30,32 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Archived legacy code
+.old/
+
+# Third-party / vendored
+SPlisHSPlasH/
+venv38/
+pybind11_optimization/
+
+# Generated artifacts
+ph_frames/
+depth_textures/
+*.gif
+*.mp4
+*.chem.txt
+*.log.txt
+imgui.ini
+error.inp
+test_output.json
+param_optimization_results.json
+param_test_results.json
+performance_report.txt
+sph_performance_detailed.txt
+sph_performance_comparison.png
+
+# Local AI tool config
+.continue/
+.kilo/
+.kilocode/

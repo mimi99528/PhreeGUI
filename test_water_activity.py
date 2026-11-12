@@ -26,8 +26,8 @@ from utils import (
     build_consecutive_mapping,
     TIME_STEP,
     TEMPERATURE,
+    MAX_VALID_CONCENTRATION,
 )
-from core_simulation import MAX_VALID_CONCENTRATION
 
 
 # ══════════════════════════════════════════════════════════════════════════

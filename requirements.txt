@@ -1,0 +1,43 @@
+# 核心科学计算库
+numpy>=1.21.0
+scipy>=1.7.0
+
+# 图形界面库
+PySide6>=6.4.0
+PySide6-Addons>=6.4.0
+PySide6-Essentials>=6.4.0
+
+# OpenGL渲染库
+moderngl>=5.8.0
+moderngl-window>=2.4.0
+PyOpenGL>=3.1.6
+Pillow>=9.0.0
+
+# 流体仿真库
+pysplishsplash>=2.10.0
+pysplashsurf>=0.10.0
+
+# 化学计算库
+phreeqcrm>=1.0.0
+
+# 并行计算和多进程
+multiprocess>=0.70.14
+
+# 数据处理和序列化
+partio>=1.10.0
+
+# 构建和开发工具
+setuptools>=65.0.0
+wheel>=0.38.0
+pybind11>=2.10.0
+
+# 可选的可视化库
+matplotlib>=3.5.0
+plotly>=5.10.0
+
+# 开发和调试工具
+objgraph>=3.5.0
+dill>=0.3.6
+
+# 兼容性库（如果需要）
+vtk>=9.1.0

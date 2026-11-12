@@ -27,6 +27,8 @@ DIFFUSION_COEFFICIENT = 0.05  # 扩散系数
 CHEMICAL_SYNC_INTERVAL = 2    # 化学同步间隔
 RECORD_INTERVAL = 10          # 数据记录间隔
 REBALANCE_FRACTION = 0.1      # 负载平衡分数
+# 原定义于 core_simulation.py，因 DPG 时代模块归档而迁至此共享叶子模块，数值保持不变
+MAX_VALID_CONCENTRATION = 500.0  # 单元浓度有效性上限(mol/L)，超过视为数值异常
 
 # ==================== 数据库路径配置 ====================
 DATABASE_PATHS = [
