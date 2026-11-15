@@ -294,7 +294,7 @@ class TestEndToEndSimulation(unittest.TestCase):
 
     模拟场景：
       - 6x6x6 网格（缩小版，保留边界梯度特性）
-      - 酸性/碱性/背景三种溶液
+      - 全中性背景溶液（与决策 D8 一致）
       - 多步扩散 + 化学反应
       - 验证无 RunCells 失败
     """
@@ -331,18 +331,11 @@ class TestEndToEndSimulation(unittest.TestCase):
         self.rm.SetTimeStep(TIME_STEP)
         self.rm.CreateMapping(list(range(self.NXYZ)))
 
-        # 分配初始溶液
+        # 分配初始溶液（决策 D8：启动场全中性，不再预铺酸/碱）
+        # 酸/碱只在真实 GUI 里由点击生成粒子时的 fluid_type 决定；
+        # 这里与生产 initialize_grid_distribution 保持一致，全部用背景溶液。
         for i in range(self.NXYZ):
-            z = i // (self.NX * self.NY)
-            y = (i % (self.NX * self.NY)) // self.NX
-            x = i % self.NX
-            if x < self.NX // 3 and y < self.NY // 3 and z < self.NZ // 3:
-                self.rm.InitialPhreeqcCell2Module(2, [i])  # 酸性
-            elif (x > 2 * self.NX // 3 and y > 2 * self.NY // 3
-                  and z > 2 * self.NZ // 3):
-                self.rm.InitialPhreeqcCell2Module(3, [i])  # 碱性
-            else:
-                self.rm.InitialPhreeqcCell2Module(1, [i])  # 背景
+            self.rm.InitialPhreeqcCell2Module(1, [i])  # 背景（中性）
 
         status = self.rm.RunCells()
         self.assertEqual(status, 0, "初始平衡应成功")

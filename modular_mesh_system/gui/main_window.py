@@ -654,10 +654,6 @@ class MainWindow(QMainWindow):
         stats_grid.addWidget(self.avg_frame_time_label, 1, 3)
         
         # Row 3
-        stats_grid.addWidget(QLabel("网格重建:"), 2, 0)
-        self.grid_time_label = QLabel("0ms")
-        stats_grid.addWidget(self.grid_time_label, 2, 1)
-        
         stats_grid.addWidget(QLabel("力计算:"), 2, 2)
         self.force_time_label = QLabel("0ms")
         stats_grid.addWidget(self.force_time_label, 2, 3)
@@ -791,10 +787,6 @@ class MainWindow(QMainWindow):
         metrics_grid.addWidget(self.current_fps_label, 0, 3)
         
         # Row 2
-        metrics_grid.addWidget(QLabel("网格重建:"), 1, 0)
-        self.grid_time_label = QLabel("0ms")
-        metrics_grid.addWidget(self.grid_time_label, 1, 1)
-        
         metrics_grid.addWidget(QLabel("力计算:"), 1, 2)
         self.force_time_label = QLabel("0ms")
         metrics_grid.addWidget(self.force_time_label, 1, 3)
@@ -984,7 +976,6 @@ class MainWindow(QMainWindow):
         # Reset system
         self.mesh_system.current_frame = 0
         self.mesh_system.current_particle_num = 0
-        self.mesh_system.last_grid_rebuild = -CONFIG.GRID_REBUILD_INTERVAL
         self.mesh_system.last_mesh_update = -CONFIG.MC_MESH_UPDATE_INTERVAL
 
         # Update UI
@@ -1145,8 +1136,6 @@ class MainWindow(QMainWindow):
             self.avg_frame_time_label.setText(f"{formatted_stats['avg_frame_time_ms']:.2f}ms")
         if hasattr(self, 'current_fps_label'):
             self.current_fps_label.setText(f"{formatted_stats['fps']}")
-        if hasattr(self, 'grid_time_label'):
-            self.grid_time_label.setText(f"{perf['grid_rebuild_time']*1000:.1f}ms")
         if hasattr(self, 'force_time_label'):
             self.force_time_label.setText(f"{perf['force_computation_time']*1000:.1f}ms")
         if hasattr(self, 'mesh_time_label'):
@@ -1295,7 +1284,6 @@ class MainWindow(QMainWindow):
         labels_to_reset = [
             ('avg_frame_time_label', "0.00ms"),
             ('current_fps_label', "0"),
-            ('grid_time_label', "0ms"),
             ('force_time_label', "0ms"),
             ('mesh_time_label', "0ms"),
             ('gpu_time_label', "0ms"),

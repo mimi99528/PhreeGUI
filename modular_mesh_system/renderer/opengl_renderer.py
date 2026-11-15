@@ -6,7 +6,7 @@ OpenGL Renderer Module
 import time
 import math
 import numpy as np
-from typing import List, Optional
+from typing import List
 
 from OpenGL.GL import glGetString
 import moderngl
@@ -82,6 +82,8 @@ class OpenGLRenderer:
         self.ssfr_depth_sigma = CONFIG.SSFR_DEPTH_SIGMA
         self.ssfr_blur_radius = CONFIG.SSFR_BLUR_RADIUS
         self.ssfr_particle_radius_world = CONFIG.SSFR_PARTICLE_RADIUS_WORLD
+        # pH 粒子色混入水体色的强度（调试面板实时可调）
+        self.particle_tint = 0.35
 
         # runtime size cache
         self._ssfr_w = 0
@@ -97,7 +99,7 @@ class OpenGLRenderer:
         self.particle_thick_prog = None
         self.particle_color_prog = None  # 新增：带颜色的粒子着色器程序
         self.particle_count = 0
-        self.particle_colors = None  # 存储粒子颜色数据
+        self.colored_particle_count = 0  # 颜色 VBO 里已写入多少个粒子的颜色
 
         # ssfr passes
         self.bilateral_prog = None
@@ -137,6 +139,9 @@ class OpenGLRenderer:
         self.depth_exposure_callback = None  # 深度数据回调函数
         self.last_depth_data = None  # 缓存的深度数据
         self.depth_exposure_format = 'numpy'  # 暴露格式: 'numpy', 'texture', 'both'
+        # 每帧整张深度纹理回读会强制 GPU 管线同步（实测单次 4 ms，一帧 3 次）。
+        # 改成"谁需要谁请求"：只有鼠标取世界坐标时才回读一次。
+        self._depth_exposure_requested = False
 
     def initialize(self, ctx):
         """Initialize OpenGL context and shaders"""
@@ -461,6 +466,7 @@ class OpenGLRenderer:
         uniform float u_caustic_strength;
         uniform float u_caustic_power;
         uniform bool u_use_particle_color;   // 新增：是否使用粒子颜色
+        uniform float u_particle_tint;       // pH 染色强度（调试面板实时可调）
 
         in vec2 v_uv;
         out vec4 frag_color;
@@ -572,13 +578,14 @@ class OpenGLRenderer:
             // 基础流体颜色
             vec3 base_fluid_color = u_water_color;
             
-            // ★ 新增：如果启用了粒子颜色，则混合粒子颜色
+            // ★ 粒子颜色（pH 着色）只做"薄薄一层"的染色：
+            //    早先按 alpha*0.7 混合，pH 色几乎完全盖住水体色，
+            //    整杯水看上去像一块荧光塑料。压到 0.35 后仍是"水"，
+            //    pH 只是水色上的一层倾向。
             if (u_use_particle_color) {
                 vec4 particle_color_sample = texture(u_particle_color, v_uv);
-                // 只有当粒子颜色的alpha > 0.1时才使用
                 if (particle_color_sample.a > 0.1) {
-                    // 混合粒子颜色和基础流体颜色
-                    base_fluid_color = mix(base_fluid_color, particle_color_sample.rgb, particle_color_sample.a * 0.7);
+                    base_fluid_color = mix(base_fluid_color, particle_color_sample.rgb, particle_color_sample.a * u_particle_tint);
                 }
             }
 
@@ -596,10 +603,14 @@ class OpenGLRenderer:
             float cgrad = length(vec2(tR - tC, tU - tC));
             float caustic_factor = clamp(cgrad * 4.0, 0.0, 1.0);
             float caustic = pow(caustic_factor, u_caustic_power) * u_caustic_strength;
-            caustic = min(caustic, 0.4);
-            color += caustic * vec3(1.0, 0.96, 0.82) * shad;
+            // 焦散在早先权重下把水面染成一片黄绿"土堆"。水面的焦散是冷白偏
+            // 微黄的高光，不该主导基色：权重压到 0.22 再叠。
+            caustic = min(caustic, 0.22);
+            color += caustic * vec3(0.95, 0.98, 1.0) * shad;
 
-            float alpha = clamp(u_alpha_base + (1.0 - trans) * 0.85 + fresnel * 0.25, 0.05, 0.98);
+            // 水面透明度：原来上限 0.98 让水像不透明塑料。水应当"越厚越实、
+            // 越薄越透"，且不做成完全不透明。
+            float alpha = clamp(u_alpha_base + (1.0 - trans) * 0.55 + fresnel * 0.30, 0.06, 0.82);
 
             frag_color = vec4(color, alpha);
         }
@@ -823,12 +834,14 @@ class OpenGLRenderer:
         self.shadow_fbo = self.ctx.framebuffer(
             color_attachments=[self.shadow_tex], depth_attachment=self._shadow_depth_rb)
 
-    def update_particles(self, positions: np.ndarray, ph_values: Optional[np.ndarray] = None):
-        """更新粒子位置数据 - 修复版，并可选更新pH颜色
-        
+    def update_particles(self, positions: np.ndarray):
+        """更新粒子位置数据
+
         Args:
             positions: shape (N,3) float32 粒子位置数组
-            ph_values: 可选的pH值数组，用于颜色可视化
+
+        颜色不在这里更新：pH→颜色由 on_ph_data_updated 单独驱动，
+        位置每帧都变而 pH 只在化学步变，绑在一起会白跑一遍 O(N) 转换。
         """
         if positions is None:
             self.particle_count = 0
@@ -852,17 +865,13 @@ class OpenGLRenderer:
         if byte_len > self.particle_vbo.size:
             self._resize_particle_buffers(byte_len, n)
 
-        # 写入粒子数据
+        # 写入粒子数据。直接传 numpy 数组（走 buffer 协议），不用 .tobytes()：
+        # 后者会再复制一整份 N*3*4 字节，10M 粒子时是每帧 120 MB 的无谓拷贝。
         try:
-            self.particle_vbo.write(pos[:n].tobytes())
-            print(f"✓ 成功更新 {n} 个粒子位置到GPU")
+            self.particle_vbo.write(pos)
         except Exception as e:
             print(f"✗ 粒子数据更新失败: {e}")
             return
-            
-        # 如果提供了pH值，同时更新颜色
-        if ph_values is not None:
-            self.update_ph_colors(ph_values[:n])
 
     def _resize_particle_buffers(self, byte_len: int, n: int):
         """调整粒子缓冲区大小"""
@@ -876,6 +885,9 @@ class OpenGLRenderer:
             
         self.particle_vbo = self.ctx.buffer(reserve=max(byte_len, CONFIG.MAX_PARTICLES * 3 * 4))
         self.particle_color_vbo = self.ctx.buffer(reserve=max(byte_len, CONFIG.MAX_PARTICLES * 3 * 4))
+        # 重建等于清空：颜色 VBO 里的旧数据没了，必须让上层重新上色，
+        # 否则渲染门会放行一批全零（黑色）颜色。
+        self.colored_particle_count = 0
 
         # 重新创建VAOs
         try:
@@ -929,83 +941,113 @@ class OpenGLRenderer:
             
         # 写入颜色数据
         try:
-            self.particle_color_vbo.write(color_data.tobytes())
-            self.particle_colors = color_data.copy()  # 保存颜色数据供参考
-            print(f"✓ 成功更新 {n} 个粒子颜色到GPU")
+            self.particle_color_vbo.write(color_data)
+            self.colored_particle_count = n
         except Exception as e:
             print(f"✗ 粒子颜色更新失败: {e}")
 
+    def fill_new_particle_colors(self, n_old: int, n_new: int):
+        """给新增的粒子尾部补「无数据」色，不重算已有粒子的颜色。
+
+        点击加粒子时只有尾部是新的，前面 n_old 个的颜色仍然有效（决策 D3
+        保证 particleId==行号，老粒子不会被重排）。原来这里靠整帧重跑
+        convert_ph_to_color 来覆盖新粒子，10M 时是每帧多花数秒。
+        """
+        if n_new <= n_old or self.particle_color_vbo is None:
+            return
+        tail = np.empty((n_new - n_old, 3), dtype=np.float32)
+        tail[:] = np.asarray(self.NO_DATA_RGB, dtype=np.float32)
+        try:
+            self.particle_color_vbo.write(tail, offset=n_old * 3 * 4)
+            self.colored_particle_count = max(self.colored_particle_count, n_new)
+        except Exception as e:
+            print(f"✗ 新增粒子颜色填充失败: {e}")
+
+    # 【决策 D9 —— 用户裁决：pH 图层按粒子画「无数据」，其余照画】
+    # 一个既不在酸端也不在碱端、明显不属于色带任何一段的中性灰蓝。
+    # 原来没有这个概念：NaN 走到色带末尾的 else 分支，t=(nan-0.857)/0.143 仍是
+    # nan，那一格颜色变成 (nan, 0, 1) 写进 VBO——"没数据"在屏幕上是一片花，
+    # 而且 np.min/np.max 一旦被 NaN 污染，范围日志也跟着说谎。
+    NO_DATA_RGB = (0.42, 0.45, 0.52)
+
     def convert_ph_to_color(self, ph_values: np.ndarray) -> np.ndarray:
         """将pH值转换为RGB颜色
-        
+
         Args:
-            ph_values: pH值数组，通常范围0-14
-            
+            ph_values: pH值数组，通常范围0-14；
+                       **允许含 NaN**，NaN/±inf 表示"该粒子本帧没有 pH 数据"
+                       （决策 D9：按粒子画「无数据」色，其余粒子照常上色，
+                       绝不把无数据画成 pH 0 / pH 7 / pH 14 中的任何一种）。
+
         Returns:
-            colors: (N,3) RGB颜色数组，值范围[0,1]
+            colors: (N,3) RGB颜色数组，值范围[0,1]，保证有限（无 NaN 写入 GPU）
         """
         if ph_values is None or len(ph_values) == 0:
             return np.zeros((0, 3), dtype=np.float32)
-            
+
+        ph_arr = np.asarray(ph_values, dtype=np.float64).ravel()
+        valid = np.isfinite(ph_arr)
+
+        # 先把所有粒子置为「无数据」色，再用真实 pH 覆盖有值的那些粒子：
+        # 这样"漏掉一个分支"最坏结果也只是显示无数据，不会显示假酸假碱。
+        colors = np.empty((ph_arr.size, 3), dtype=np.float32)
+        colors[:] = np.asarray(self.NO_DATA_RGB, dtype=np.float32)
+
         # 将pH值归一化到[0,1]范围
         # pH 0-14 映射到 0-1
-        normalized_ph = np.clip((ph_values - 0.0) / (14.0 - 0.0), 0.0, 1.0)
-        
-        # 使用彩虹色谱：红(酸性) -> 黄 -> 绿 -> 蓝(碱性)
-        colors = np.zeros((len(normalized_ph), 3), dtype=np.float32)
-        
-        for i, ph_norm in enumerate(normalized_ph):
-            if ph_norm < 0.214:  # 强酸性 (pH 1-3): 深红到橙红
-                # 深红色到橙红色渐变
-                t = ph_norm / 0.214
-                colors[i] = [1.0, t * 0.4, 0.0]  # 从深红(1,0,0)到橙红(1,0.4,0)
-            elif ph_norm < 0.429:  # 中酸性 (pH 4-6): 橙色到黄绿色
-                # 橙色到黄色再到黄绿色
-                t = (ph_norm - 0.214) / (0.429 - 0.214)
-                if t < 0.5:  # 橙色到黄色
-                    colors[i] = [1.0, 0.4 + t * 0.6, 0.0]
-                else:  # 黄色到黄绿色
-                    t2 = (t - 0.5) * 2.0
-                    colors[i] = [1.0 - t2 * 0.3, 1.0, t2 * 0.3]
-            elif ph_norm < 0.5:  # 中性 (pH 7): 绿色
-                # 绿色或浅黄绿色
-                t = (ph_norm - 0.429) / (0.5 - 0.429)
-                colors[i] = [0.7 + t * 0.3, 1.0, 0.3 + t * 0.4]
-            elif ph_norm < 0.643:  # 弱碱性 (pH 8-9): 蓝绿色到浅蓝色
-                # 蓝绿色到浅蓝色
-                t = (ph_norm - 0.5) / (0.643 - 0.5)
-                colors[i] = [0.0, 1.0 - t * 0.3, 0.7 + t * 0.3]
-            elif ph_norm < 0.857:  # 中碱性 (pH 10-11): 深蓝色
-                # 深蓝色渐变
-                t = (ph_norm - 0.643) / (0.857 - 0.643)
-                colors[i] = [0.0, 0.3 + t * 0.4, 1.0]
-            else:  # 强碱性 (pH 12-14): 紫色到蓝紫色
-                # 紫色到蓝紫色
-                t = (ph_norm - 0.857) / (1.0 - 0.857)
-                colors[i] = [t * 0.6, 0.0, 1.0]
-                
+        normalized_ph = np.clip((ph_arr - 0.0) / (14.0 - 0.0), 0.0, 1.0)
+
+        # 色带是 6 段分段线性（中酸段内部再分两半）。原实现逐粒子走 if/elif
+        # 链，是 O(N) 次 Python 解释执行；这里按段分组，每段整块向量化，
+        # 断点与各式系数与原逐粒子版本逐字一致（含浮点减法写法）。
+        rows = np.flatnonzero(valid)
+        if rows.size == 0:
+            return colors
+        x_all = normalized_ph[rows]
+        edges = (0.214, 0.429, 0.5, 0.643, 0.857)
+        seg = np.searchsorted(edges, x_all, side="right")
+
+        for s in range(6):
+            sel = np.flatnonzero(seg == s)
+            if sel.size == 0:
+                continue
+            x = x_all[sel]
+            rgb = np.empty((sel.size, 3), dtype=np.float32)
+            if s == 0:      # 强酸性 (pH 1-3): 深红到橙红
+                t = x / 0.214
+                rgb[:, 0] = 1.0
+                rgb[:, 1] = t * 0.4
+                rgb[:, 2] = 0.0
+            elif s == 1:    # 中酸性 (pH 4-6): 橙 -> 黄 -> 黄绿
+                t = (x - 0.214) / (0.429 - 0.214)
+                first = t < 0.5
+                t2 = (t - 0.5) * 2.0
+                rgb[:, 0] = np.where(first, 1.0, 1.0 - t2 * 0.3)
+                rgb[:, 1] = np.where(first, 0.4 + t * 0.6, 1.0)
+                rgb[:, 2] = np.where(first, 0.0, t2 * 0.3)
+            elif s == 2:    # 中性 (pH 7): 绿色
+                t = (x - 0.429) / (0.5 - 0.429)
+                rgb[:, 0] = 0.7 + t * 0.3
+                rgb[:, 1] = 1.0
+                rgb[:, 2] = 0.3 + t * 0.4
+            elif s == 3:    # 弱碱性 (pH 8-9): 蓝绿到浅蓝
+                t = (x - 0.5) / (0.643 - 0.5)
+                rgb[:, 0] = 0.0
+                rgb[:, 1] = 1.0 - t * 0.3
+                rgb[:, 2] = 0.7 + t * 0.3
+            elif s == 4:    # 中碱性 (pH 10-11): 深蓝
+                t = (x - 0.643) / (0.857 - 0.643)
+                rgb[:, 0] = 0.0
+                rgb[:, 1] = 0.3 + t * 0.4
+                rgb[:, 2] = 1.0
+            else:           # 强碱性 (pH 12-14): 紫到蓝紫
+                t = (x - 0.857) / (1.0 - 0.857)
+                rgb[:, 0] = t * 0.6
+                rgb[:, 1] = 0.0
+                rgb[:, 2] = 1.0
+            colors[rows[sel]] = rgb
+
         return colors
-        
-    def update_ph_colors(self, ph_values: np.ndarray):
-        """根据pH值更新粒子颜色
-        
-        Args:
-            ph_values: pH值数组，长度应该与粒子数量匹配
-        """
-        if ph_values is None or len(ph_values) == 0:
-            print("⚠ 无效的pH值数据")
-            return
-            
-        # 转换pH值为颜色
-        colors = self.convert_ph_to_color(ph_values)
-        
-        # 更新GPU中的颜色数据
-        self.update_particle_colors(colors)
-        
-        # 启用彩色粒子渲染
-        self.use_colored_particles = True
-        
-        print(f"✓ 已更新 {len(ph_values)} 个粒子的pH颜色 (范围: {np.min(ph_values):.2f} - {np.max(ph_values):.2f})")
 
     def _create_vertex_data(self, vertices, triangles):
         """
@@ -1108,7 +1150,6 @@ class OpenGLRenderer:
         self._ensure_ssfr_targets(width, height)
         self._ensure_shadow_targets(width, height)
         self.use_colored_particles  = True
-        self._immediate_depth_exposure = True  # 控制是否立即暴露原始深度
         near, far = 0.1, 100.0
         projection = create_perspective_matrix(60.0, width / height, near, far)
         cam_pos = calculate_camera_position(self.camera_distance, self.camera_angle_x, self.camera_angle_y, self.camera_target)
@@ -1137,23 +1178,15 @@ class OpenGLRenderer:
             p['u_viewport_h'].value = float(self._ssfr_h)
             p['u_point_scale'].value = 1.0
             self.particle_vao_depth.render(mode=moderngl.POINTS, vertices=self.particle_count)
-            print(f"✓ 渲染了 {self.particle_count} 个粒子的深度")
+            self._tlog.print(f"✓ 渲染了 {self.particle_count} 个粒子的深度")
         else:
-            print(f"⚠ 深度pass: 粒子数量为 {self.particle_count}，仅执行清屏操作")
-
-        # ★ 新增：立即暴露原始深度数据（如果需要）
-        if (self.expose_depth_buffer and 
-            hasattr(self, '_immediate_depth_exposure') and 
-            self._immediate_depth_exposure):
-            print("★ 执行即时深度暴露...")
-            self._expose_depth_for_projection(self.depth_tex0)
+            self._tlog.print(f"⚠ 深度pass: 粒子数量为 {self.particle_count}，仅执行清屏操作")
 
         # Pass 1.5 - Colored Particles (新增：独立的颜色渲染pass)
         if (hasattr(self, 'use_colored_particles') and 
             self.use_colored_particles and 
             self.particle_count > 0 and
-            self.particle_colors is not None and 
-            len(self.particle_colors) >= self.particle_count):
+            self.colored_particle_count >= self.particle_count):
             
             # 切换到彩色粒子FBO (MRT)
             self.color_particle_fbo.use()
@@ -1175,7 +1208,7 @@ class OpenGLRenderer:
             p['u_point_scale'].value = 1.0
             self.particle_vao_colored.render(mode=moderngl.POINTS, vertices=self.particle_count)
             
-            print(f"✓ 渲染了 {self.particle_count} 个彩色粒子")
+            self._tlog.print(f"✓ 渲染了 {self.particle_count} 个彩色粒子")
         
         self.ctx.disable(moderngl.BLEND)
 
@@ -1192,10 +1225,11 @@ class OpenGLRenderer:
             self.last_depth_save_time = current_time
             self.depth_frame_counter += 1
 
-        # ★ 新增：暴露深度缓冲用于反投影
-        if self.expose_depth_buffer:
-            print("★ 执行最终深度暴露...")
+        # 需要时回读一次最终（双边滤波后）深度：供鼠标反投影使用。
+        # 每帧无条件回读会让 GPU 管线同步等待，是历史上最大的单帧卡顿源。
+        if self.expose_depth_buffer and self._depth_exposure_requested:
             self._expose_depth_for_projection(final_depth_tex)
+            self._depth_exposure_requested = False
 
         # Pass 3 - Thickness
         self.thick_fbo.use()
@@ -1245,12 +1279,6 @@ class OpenGLRenderer:
         self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
         self.ctx.clear(0.06, 0.08, 0.12, 1.0)
 
-        # ★ 新增：在复合渲染前也可以暴露深度（如果需要原始深度）
-        if (self.expose_depth_buffer and 
-            hasattr(self, 'depth_tex0') and 
-            self.depth_tex0 is not None):
-            self._expose_depth_for_projection(self.depth_tex0)
-
         cp = self.composite_prog
 
         cp['u_texel'].value = (1.0 / self._ssfr_w, 1.0 / self._ssfr_h)
@@ -1272,6 +1300,7 @@ class OpenGLRenderer:
         cp['u_shadow_strength'].value = CONFIG.SHADOW_STRENGTH
         cp['u_caustic_strength'].value = CONFIG.CAUSTIC_STRENGTH
         cp['u_caustic_power'].value = CONFIG.CAUSTIC_POWER
+        cp['u_particle_tint'].value = float(getattr(self, 'particle_tint', 0.35))
 
         # 绑定纹理
         final_depth_tex.use(location=0)
@@ -1286,7 +1315,7 @@ class OpenGLRenderer:
         if use_particle_color:
             self.color_particle_color_tex.use(location=3)
             cp['u_particle_color'].value = 3
-            print("✓ 使用粒子颜色纹理进行渲染")
+            self._tlog.print("✓ 使用粒子颜色纹理进行渲染")
         else:
             # 如果没有粒子颜色，绑定一个默认的黑色纹理或者使用depth纹理作为占位符
             final_depth_tex.use(location=3)  # 占位符
@@ -1516,7 +1545,8 @@ class OpenGLRenderer:
         self.expose_depth_buffer = True
         self.depth_exposure_callback = callback
         self.depth_exposure_format = format
-        print("✓ 深度缓冲暴露已启用")
+        self._depth_exposure_requested = True
+        print("✓ 深度缓冲暴露已启用（按需回读）")
         
     def disable_depth_exposure(self):
         """禁用深度缓冲暴露"""
@@ -1524,6 +1554,11 @@ class OpenGLRenderer:
         self.depth_exposure_callback = None
         print("✓ 深度缓冲暴露已禁用")
         
+    def request_depth_exposure(self):
+        """请求在本帧渲染时回读一次深度（供鼠标反投影取世界坐标）。"""
+        if self.expose_depth_buffer:
+            self._depth_exposure_requested = True
+
     def get_exposed_depth_data(self):
         """获取最近一次暴露的深度数据
         
@@ -1537,7 +1572,8 @@ class OpenGLRenderer:
         
         # 返回numpy数据
         if self.depth_exposure_format in ['numpy', 'both'] and self.last_depth_data is not None:
-            result['data'] = self.last_depth_data.copy()
+            # 调用方只按坐标取值，不回写，直接给缓存引用，避免每次点鼠标复制整张深度图
+            result['data'] = self.last_depth_data
             
         # 返回纹理对象
         if self.depth_exposure_format in ['texture', 'both']:
@@ -1590,7 +1626,7 @@ class OpenGLRenderer:
             if data_max == 0.0:
                 print(f"⚠ 深度数据全为0! 纹理尺寸: {width}x{height}")
                 print(f"  粒子数量: {self.particle_count}")
-                print(f"  粒子颜色数据: {self.particle_colors is not None if hasattr(self, 'particle_colors') else 'N/A'}")
+                print(f"  已上色粒子数: {self.colored_particle_count}")
                 print(f"  粒子VBO状态: {self.particle_vbo is not None}")
                 print(f"  深度VAO状态: {self.particle_vao_depth is not None}")
                 print(f"  深度程序状态: {self.particle_depth_prog is not None}")

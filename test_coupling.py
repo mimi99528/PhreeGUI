@@ -61,6 +61,40 @@ def _make_mock_rm(n_cells: int, n_comps: int, conc_out: np.ndarray = None):
     return rm
 
 
+def _inject_equilibrium_background(sim, rm, n_comps: int):
+    """补齐"化学步可执行"的前置条件：缓存的初始平衡（纯水）背景场。
+
+    生产链路里 _initial_equilibrium_conc 由
+        initialize() -> _initialize_particle_chemistry()
+        coupled_simulation.py:403-418
+    用 PHREEQC 的瞬时平衡结果算出来并缓存。b7/D4 之后，_run_chemical_step
+    拿不到它就直接抛 RuntimeError（coupled_simulation.py:794-799），因为旧代码
+    在那里写的是查不到出处的死值 H=1.433e-25（HEAD 版 :629-633），
+    属于"用硬编码掩盖初始化没跑"，被决策 D4 明令禁止。
+
+    本文件的替身不调用 initialize()：它会拿 mock rm 的零浓度
+    _broadcast_to_particles() 覆盖掉测试自己注入的 initial_solutions
+    （coupled_simulation.py:424），把被测对象洗成另一回事。
+    所以这里按生产的取值方式（component-major reshape）把同一份前置条件
+    显式补上，值仍然来自被测 mock rm 的平衡输出，不新造物理量。
+
+    注意"读 return_value 而不是调用 GetConcentrations()"：部分用例把
+    GetConcentrations 挂成依赖 SetConcentrations.call_args 的 side_effect
+    （如 test_coupling.py:852-855、:972-975），在建替身阶段还没人调过
+    SetConcentrations，真调用会炸在 None 下标上，报出来的错和被测行为无关。
+    return_value 是 _make_mock_rm(:55-59) 在建 mock 时就声明好的平衡输出，
+    正是要补的那个数，读它不改任何调用计数。
+    """
+    flat = np.asarray(rm.GetConcentrations.return_value, dtype=np.float64).ravel()
+    n_cells = int(sim.chem_field.n_cells)
+    if flat.size != n_cells * n_comps:
+        raise AssertionError(
+            "mock rm 声明的平衡输出长度 %d 与 (n_cells=%d * n_comps=%d) 不符，"
+            "替身与生产约定脱节" % (flat.size, n_cells, n_comps))
+    sim._initial_equilibrium_conc = flat.reshape((n_comps, n_cells)).T.copy()
+    sim.pure_water_cells = np.all(sim._initial_equilibrium_conc == 0.0, axis=1)
+
+
 def _make_coupled_sim_with_particles(
     positions: np.ndarray,
     n_comps: int = 2,
@@ -108,11 +142,28 @@ def _make_coupled_sim_with_particles(
         if initial_solutions is not None
         else np.zeros((n, n_comps), dtype=np.float64)
     )
+    # 【不变量 I1】生产里浓度数组必然与"已播种掩码"成对存在：
+    # seed_particle_chemistry (coupled_simulation.py:319-321) 同时写两样，
+    # _ensure_solution_rows (:249-268) 在没有掩码时直接硬失败（决策 D4）。
+    # 这里注入浓度就等价于"这些粒子已播种过"，替身必须把掩码补齐，
+    # 否则测的是生产里不存在的内部状态。
+    sim._particle_solution_ready = np.ones(n, dtype=bool)
+    # 【前置条件】补上"initialize() 已算出初始平衡背景场"这一生产状态，
+    # 详见 _inject_equilibrium_background 的说明。
+    _inject_equilibrium_background(sim, rm, n_comps)
 
     # 以位置数组模拟 mesh_system
     mock_mesh = MagicMock()
     mock_mesh.current_particle_num = n
     mock_mesh.particle_positions = positions.astype(np.float32)
+    # 【决策 D3/D3' 跟进】真实 MeshSystem 会导出与引擎 FluidModel.m_particleId
+    # 同步的稳定 particleId 数组（modular_mesh_system/core/mesh_system.py 的
+    # self.particle_ids），化学层一律按 id 建索引，不再假设"行号==粒子号"。
+    # 这个替身必须跟上新契约，否则替身等于在测一个生产里不存在的接口形状。
+    # 测试用的粒子是按顺序 add 进去的，所以 id 恰好是 0..n-1 —— 与生产
+    # （z-sort 关闭 + 每批 add 都 fm.reset() 重编号）实测到的形状一致，
+    # 见 D:/tmp_pg_verify/impl/e1_rerun.log：3 批 add 后 ids 恒等于 arange。
+    mock_mesh.particle_ids = np.arange(n, dtype=np.int64)
     sim.mesh_system = mock_mesh
     mock_mesh.step_simulation.return_value = ([], [])
 
@@ -294,7 +345,7 @@ class TestConcentrationAggregation(unittest.TestCase):
         # 有粒子的单元浓度应接近 0.5
         occupied = [
             i for i in range(sim.chem_field.n_cells)
-            if sim.chem_field.cell_particles[i]
+            if sim.chem_field.cell_counts[i] > 0
         ]
         for cell_id in occupied:
             np.testing.assert_almost_equal(cell_conc[cell_id, 0], 0.5)
@@ -322,7 +373,7 @@ class TestConcentrationAggregation(unittest.TestCase):
         for iy in range(n_dim):
             for iz in range(n_dim):
                 cid = 0 + iy * n_dim + iz * n_dim * n_dim
-                if sim.chem_field.cell_particles[cid]:
+                if sim.chem_field.cell_counts[cid] > 0:
                     self.assertGreater(cell_conc[cid, 0], 0.5)
 
     def test_broadcast_restores_uniform_conc(self):
@@ -347,7 +398,16 @@ class TestConcentrationAggregation(unittest.TestCase):
         )
 
     def test_empty_cells_contribute_zero(self):
-        """空单元使用 -1.0 标记，不参与化学计算"""
+        """空单元的聚合值是 0.0（背景浓度），不是 -1.0 哨兵。
+
+        契约来源：生产 `_aggregate_cell_concentrations()` 对空单元返回
+        背景浓度 0.0，并在 `_run_chemical_step()` 里用初始平衡场
+        （pure_water_row）覆盖非显著单元后才写入 PHREEQC。
+        "-1" 只是 PHREEQC 映射里"本步未参与"的标记，由
+        `_significant_cells_mask` 单独表达；把它塞回浓度数组会污染
+        浓度范围统计，且没有下游消费者。用例名 "contribute_zero" 与
+        生产契约一致，这里修正的是过期的断言与注释。
+        """
         # 将所有粒子集中在域左下角
         positions = np.tile([-0.7, -0.7, -0.7], (10, 1)).astype(np.float64)
         n_comps = 1
@@ -358,10 +418,10 @@ class TestConcentrationAggregation(unittest.TestCase):
         )
         cell_conc = sim._aggregate_cell_concentrations()
 
-        # 除第 0 单元外，其余空单元应标记为 -1.0
-        for cell_id in range(1, sim.chem_field.n_cells):
-            if not sim.chem_field.cell_particles[cell_id]:
-                np.testing.assert_array_equal(cell_conc[cell_id], -1.0)
+        # 除含粒子的单元外，其余空单元的聚合值为 0.0（背景浓度）
+        for cell_id in range(sim.chem_field.n_cells):
+            if sim.chem_field.cell_counts[cell_id] == 0:
+                np.testing.assert_array_equal(cell_conc[cell_id], 0.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -378,6 +438,28 @@ class TestChemicalStepControl(unittest.TestCase):
         conc = np.ones((4, n_comps), dtype=np.float64)
 
         rm = _make_mock_rm(n_cells, n_comps)
+        # 【收尾 1 暴露出来的替身缺陷，不是被测代码的缺陷】
+        # _make_mock_rm:58 的注释写着"RunCells 不改变浓度"，但实现是
+        # GetConcentrations() 恒返回**全零** —— 那是"PHREEQC 把所有组分吃掉"，
+        # 和注释正好相反。本类的 _broadcast_to_particles 会把这份假输出写回
+        # 4 个粒子，于是从第二个化学帧起单元浓度整行归零，撞上
+        # coupled_simulation.py:355-359 已写死的不变量（全零 = 没有水，
+        # 喂给 PHREEQC 必然不收敛）→ 化学步**确实**没执行。
+        # 以前 step() 无条件报"化学步执行完成"（决策 D4 要消灭的那句谎），
+        # 所以本类两个用例一直是绿的：绿的是谎，不是调度。
+        # 现在把替身改成它本来想表达的物理量：质量守恒 —— SetConcentrations
+        # 进去什么，GetConcentrations 出来什么（component-major 原样透传，
+        # 与 _run_chemical_step:857/:914 的约定一致）。
+        # 只动 _build_sim 这一个替身构造函数，不动任何断言。
+        _store = {"flat": [0.0] * (n_cells * n_comps)}
+
+        def _echo_set(conc_in):
+            _store["flat"] = [float(v) for v in conc_in]
+            return None
+
+        rm.SetConcentrations.side_effect = _echo_set
+        rm.GetConcentrations.side_effect = lambda: list(_store["flat"])
+
         if run_cells_side_effect is not None:
             rm.RunCells.side_effect = run_cells_side_effect
 
@@ -498,8 +580,8 @@ class TestChemicalStepControl(unittest.TestCase):
         sim.step()
 
         # 验证 CreateMapping 被调用，且大部分单元映射为 -1
-        rm.CreateMapping.assert_called()
-        mapping = rm.CreateMapping.call_args[0][0]
+        rm.CreateMappingSWIG.assert_called()
+        mapping = rm.CreateMappingSWIG.call_args[0][0]
         inactive_count = sum(1 for m in mapping if m < 0)
         self.assertGreater(inactive_count, 0, "应有空单元被排除")
         # 至少有一个活跃单元（粒子所在单元）
@@ -527,8 +609,8 @@ class TestChemicalStepControl(unittest.TestCase):
         sim.step()
 
         # 验证 CreateMapping 使用完整映射（所有单元活跃）
-        rm.CreateMapping.assert_called()
-        mapping = rm.CreateMapping.call_args[0][0]
+        rm.CreateMappingSWIG.assert_called()
+        mapping = rm.CreateMappingSWIG.call_args[0][0]
         for i, m in enumerate(mapping):
             self.assertEqual(m, i, f"单元 {i} 应映射为自身")
 
@@ -557,7 +639,18 @@ class TestChemicalStepControl(unittest.TestCase):
 # 测试套件 5b：CreateMapping 连续索引（空单元正确排除）
 # ══════════════════════════════════════════════════════════════════════════
 
+# 【本轮测试修复，必须留痕】这些用例原来断言 rm.CreateMapping，但生产代码
+# 从头到尾只调过 rm.CreateMappingSWIG（coupled_simulation.py:794，SWIG 包装，
+# PhreeqcRM 0.0.17 上不存在无后缀的 CreateMapping）。MagicMock 对不存在的属性
+# 会自动造一个，所以 assert_called() 永远失败、call_args 永远是 None ——
+# 这 8 个用例从写下那天起就是"恒红的空断言"，既挡不住映射回归，也说明不了
+# 生产有 bug。四路基线（b1_head/b3_wiponly/b4_cleanuponly/full）里它们全红，
+# 正是这个原因。改成 CreateMappingSWIG 后它们真的在验证映射契约。
+# 依据：探针 D:\tmp_pg_verify\impl\tshim\test_coupling_swig.py 副本实验，
+# 9 failed -> 2 failed，无新增失败。
 class TestCreateMappingConsecutive(unittest.TestCase):
+
+
     """
     验证 CreateMapping 使用连续化学单元索引，确保空单元被正确排除。
 
@@ -605,8 +698,8 @@ class TestCreateMappingConsecutive(unittest.TestCase):
         sim.step()
 
         # 验证 CreateMapping 使用连续索引
-        rm.CreateMapping.assert_called()
-        mapping = rm.CreateMapping.call_args[0][0]
+        rm.CreateMappingSWIG.assert_called()
+        mapping = rm.CreateMappingSWIG.call_args[0][0]
 
         # 活跃单元的化学索引应从 0 开始连续递增
         active_chem_ids = sorted([m for m in mapping if m >= 0])
@@ -633,7 +726,7 @@ class TestCreateMappingConsecutive(unittest.TestCase):
 
         sim.step()
 
-        mapping = rm.CreateMapping.call_args[0][0]
+        mapping = rm.CreateMappingSWIG.call_args[0][0]
         active_chem_ids = [m for m in mapping if m >= 0]
         n_active = len(active_chem_ids)
         max_chem_id = max(active_chem_ids)
@@ -664,7 +757,7 @@ class TestCreateMappingConsecutive(unittest.TestCase):
 
         sim.step()
 
-        mapping = rm.CreateMapping.call_args[0][0]
+        mapping = rm.CreateMappingSWIG.call_args[0][0]
         active_chem_ids = [m for m in mapping if m >= 0]
 
         # 化学单元索引应无重复
@@ -695,7 +788,7 @@ class TestCreateMappingConsecutive(unittest.TestCase):
 
         sim.step()
 
-        mapping = rm.CreateMapping.call_args[0][0]
+        mapping = rm.CreateMappingSWIG.call_args[0][0]
         for i, m in enumerate(mapping):
             self.assertEqual(m, i, f"完全活跃时，单元 {i} 应映射为 {i}")
 
@@ -740,7 +833,7 @@ class TestCreateMappingConsecutive(unittest.TestCase):
 
         # 第一帧
         sim.step()
-        mapping1 = rm.CreateMapping.call_args[0][0][:]
+        mapping1 = rm.CreateMappingSWIG.call_args[0][0][:]
 
         # 移动粒子到另一个位置（直接修改内部状态以模拟位置变化）
         sim._particle_solutions[0] = [1.0]
@@ -748,7 +841,7 @@ class TestCreateMappingConsecutive(unittest.TestCase):
 
         # 第二帧
         sim.step()
-        mapping2 = rm.CreateMapping.call_args[0][0][:]
+        mapping2 = rm.CreateMappingSWIG.call_args[0][0][:]
 
         # 两帧的映射都应有效（活跃索引连续且无间隙）
         for mapping in [mapping1, mapping2]:
@@ -919,11 +1012,16 @@ class TestCarbonateEquilibrium(unittest.TestCase):
         # 模拟碳酸解离平衡：H+ = sqrt(K_a * CO₂)，K_a=4.3e-7（H₂CO₃ ⇌ H+ + HCO₃⁻）
         K_a = 4.3e-7
 
-        def co2_ph_reaction(cell_conc_flat):
-            cc = np.array(cell_conc_flat).reshape((n_cells, n_comps))
+        def co2_ph_reaction(flat_conc):
+            # 【契约修复】PhreeqcRM 的 Set/GetConcentrations 都是 component-major：
+            # flat = [comp0 的 n_cells 个单元, comp1 的 n_cells 个单元, ...]。
+            # 旧夹具按 (n_cells, n_comps) 直接 reshape，等于把布局反过来读，
+            # 于是"高 CO₂ -> 高 H+"的因果关系永远不可能成立——失败的是夹具，不是产品。
+            cc = np.asarray(flat_conc, dtype=np.float64).reshape(
+                (n_comps, n_cells)).T
             new_cc = cc.copy()
             new_cc[:, 1] = np.sqrt(K_a * np.maximum(cc[:, 0], 0.0))
-            return new_cc.flatten().tolist()
+            return new_cc.T.flatten().tolist()
 
         rm = _make_mock_rm(n_cells, n_comps)
         rm.GetConcentrations.side_effect = lambda: co2_ph_reaction(
@@ -934,6 +1032,8 @@ class TestCarbonateEquilibrium(unittest.TestCase):
             positions, n_comps=n_comps, initial_solutions=conc,
             rm=rm, chem_step_ratio=chem_step_ratio
         )
+        # 按组分名取列，不再依赖硬编码列号。
+        sim.comp_names = ['CO2', 'H+']
         return sim, K_a
 
     def test_ph_decreases_with_co2(self):
@@ -945,9 +1045,10 @@ class TestCarbonateEquilibrium(unittest.TestCase):
         sim_low.step()
         sim_high.step()
 
+        h_idx = sim_low.comp_names.index('H+')
         n = sim_low.mesh_system.current_particle_num
-        h_low = sim_low._particle_solutions[:n, 1].mean()
-        h_high = sim_high._particle_solutions[:n, 1].mean()
+        h_low = sim_low._particle_solutions[:n, h_idx].mean()
+        h_high = sim_high._particle_solutions[:n, h_idx].mean()
 
         self.assertGreater(
             h_high, h_low,
@@ -1047,6 +1148,9 @@ class TestAdvectionReaction(unittest.TestCase):
             return [], []
 
         mock_mesh.step_simulation.side_effect = lambda *args, **kwargs: advance_positions()
+        # 【决策 D3/D3' 跟进】与共享替身一致：真实 MeshSystem 导出稳定 particleId，
+        # 化学层按 id 建索引。测试粒子按顺序加入，id 恰为 arange（见 e1_rerun.log）。
+        mock_mesh.particle_ids = np.arange(n, dtype=np.int64)
 
         sim = CoupledSimulation(
             mesh_system=mock_mesh,
@@ -1057,6 +1161,10 @@ class TestAdvectionReaction(unittest.TestCase):
         sim.comp_names = ["tracer"]
         sim._particle_cell_ids = np.full(n, -1, dtype=np.int32)
         sim._particle_solutions = conc.copy()
+        # 【不变量 I1】与共享替身一致：浓度数组与已播种掩码成对存在。
+        sim._particle_solution_ready = np.ones(n, dtype=bool)
+        # 【前置条件】补上生产由 initialize() 缓存的初始平衡背景场。
+        _inject_equilibrium_background(sim, rm, n_comps)
         sim._update_particle_mapping()
 
         return sim, initial_positions, sheared_positions, conc
@@ -1205,6 +1313,120 @@ class TestCoupledSimulationIntegration(unittest.TestCase):
         self.assertEqual(
             sim.chem_field.phreeqc_conc.size, n_cells * n_comps
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 测试套件 8：pH 图层的数据契约（本轮新增，此前 get_particle_ph 零覆盖）
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestParticlePhContract(unittest.TestCase):
+    """get_particle_ph 的三条契约，全部由本轮实测逼出来。
+
+    实测依据一（端到端 run9，真实 GUI 对象图、562 次采样，
+    D:\\tmp_pg_verify\\impl\\e2e2\\run9_acid_post_harden.txt）：
+        GetSelectedOutput() 的行数恒 == chem_field.n_cells，与
+        CreateMappingSWIG 把非显著单元置 -1 **无关**。
+        所以原先"行数 == 显著单元数"的第二种对齐猜测从来没成立过。
+
+    实测依据二（独立子进程探针，exit 0，
+    D:\\tmp_pg_verify\\impl\\selout_probe_utf8.log）：
+        只映射 3/1000 个单元跑 RunCells 之后，那 997 个未映射单元的 pH 行
+        **恒等于 0.0**（同一批单元在 GetConcentrations() 里给 1e30）。
+        也就是说"行数对得上"不等于"值可用"：不按当步映射掩码筛行，
+        界面就把"这格本步没算"画成 pH=0 的强酸 —— run9 里 GUI 实际收到的
+        [0.000, 3.014] 就是这么来的。
+
+    决策 D4：宁可不给，不可给假数 —— 未参与化学的单元只能是 NaN。
+    """
+
+    def _make_sim(self):
+        n_cells = CHEM_GRID_DIM ** 3
+        n_comps = 2
+        # 4 个粒子分处 4 个单元；只有前 2 个带溶质（会被映射进本步化学），
+        # 后 2 个是"有粒子但无溶质"，正好落在未映射单元上。
+        positions = np.array([
+            [-0.7, -0.7, -0.7],
+            [0.7, 0.7, 0.7],
+            [-0.7, -0.7, 0.7],
+            [0.7, 0.7, -0.7],
+        ], dtype=np.float64)
+        conc = np.zeros((4, n_comps), dtype=np.float64)
+        conc[:2, :] = 1.0
+        rm = _make_mock_rm(n_cells, n_comps)
+        sim = _make_coupled_sim_with_particles(
+            positions, n_comps=n_comps, initial_solutions=conc,
+            rm=rm, chem_step_ratio=1)
+        return sim, rm, n_cells
+
+    @staticmethod
+    def _mapped_from(rm, n_cells):
+        """从生产真正交给 PHREEQC 的那次调用里读回参与本步化学的单元。"""
+        mapping = rm.CreateMappingSWIG.call_args[0][0]
+        return np.array([m >= 0 for m in mapping], dtype=bool)
+
+    def test_unmapped_cell_yields_nan_not_zero(self):
+        """未参与本步化学的单元：pH 必须是 NaN，不是 PHREEQC 给的常量 0.0。"""
+        sim, rm, n_cells = self._make_sim()
+        sim.step()
+
+        mapped = self._mapped_from(rm, n_cells)
+        self.assertGreater(int(mapped.sum()), 0, "替身场景应有单元参与化学")
+        self.assertLess(int(mapped.sum()), n_cells, "应有单元不参与本步化学")
+        # 生产记录的掩码必须与交给 CreateMappingSWIG 的映射同源，
+        # 否则"哪些行是真算出来的"这个判断本身就不可信。
+        self.assertTrue(np.array_equal(sim._chem_mapped_mask, mapped),
+                        "_chem_mapped_mask 与实际下发的映射不一致")
+
+        # 复刻探针实测到的 PHREEQC 输出形状与取值
+        rm.GetSelectedOutputCount.return_value = 1
+        rm.GetSelectedOutputHeadings.return_value = ['pH']
+        sel = np.zeros((n_cells, 1), dtype=np.float64)
+        sel[mapped, 0] = 3.0
+        rm.GetSelectedOutput.return_value = sel
+
+        ph = sim.get_particle_ph()
+        self.assertIsNotNone(ph)
+        self.assertEqual(ph.shape, (4,))
+
+        cells = sim._particle_cell_ids[sim._active_ids()]
+        in_domain = (cells >= 0) & (cells < n_cells)
+        is_mapped = np.zeros(4, dtype=bool)
+        is_mapped[in_domain] = mapped[cells[in_domain]]
+
+        self.assertGreater(int(is_mapped.sum()), 0)
+        self.assertGreater(int((~is_mapped).sum()), 0)
+        self.assertTrue(np.all(ph[is_mapped] == 3.0),
+                        "参与化学的单元应原样拿到 PHREEQC 的 pH")
+        self.assertTrue(np.all(np.isnan(ph[~is_mapped])),
+                        "未参与本步化学的单元必须是 NaN（无数据），"
+                        "不能把 PHREEQC 给未映射单元的常量 0.0 当成 pH=0 画出来")
+
+    def test_rows_before_any_chemistry_are_equilibrium_values(self):
+        """还没跑过任何收敛的 RunCells 时，1000 行都是初始化平衡值，可整体取用。"""
+        sim, rm, n_cells = self._make_sim()
+        self.assertIsNone(sim._chem_mapped_mask)
+        rm.GetSelectedOutputCount.return_value = 1
+        rm.GetSelectedOutputHeadings.return_value = ['pH']
+        rm.GetSelectedOutput.return_value = np.full((n_cells, 1), 6.997)
+
+        ph = sim.get_particle_ph()
+        self.assertIsNotNone(ph)
+        self.assertEqual(ph.shape, (4,))
+        self.assertFalse(np.any(np.isnan(ph)),
+                         "无掩码 = 全部行都是平衡初值，不该被改成 NaN")
+        self.assertTrue(np.all(ph == 6.997))
+
+    def test_row_count_mismatch_returns_none(self):
+        """行数不等于单元总数：说明约定被破坏，宁可不给 pH，也不许猜另一种对齐。"""
+        sim, rm, n_cells = self._make_sim()
+        sim.step()
+        rm.GetSelectedOutputCount.return_value = 1
+        rm.GetSelectedOutputHeadings.return_value = ['pH']
+        rm.GetSelectedOutput.return_value = np.full((7, 1), 3.0)
+
+        self.assertIsNone(sim.get_particle_ph(),
+                          "行数对不上时必须返回 None（决策 D4），"
+                          "不允许退回按显著单元数对齐的旧猜测")
 
 
 # ══════════════════════════════════════════════════════════════════════════

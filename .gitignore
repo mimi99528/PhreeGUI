@@ -42,6 +42,7 @@ pybind11_optimization/
 # Generated artifacts
 ph_frames/
 depth_textures/
+output/
 *.gif
 *.mp4
 *.chem.txt

@@ -8,6 +8,25 @@ import subprocess
 import sys
 import os
 
+
+def _force_utf8_streams():
+    """GBK(cp936) 控制台/重定向下 print 中文或对勾会抛 UnicodeEncodeError。
+    这里在任何输出发生前把 stdout/stderr 切到 UTF-8 + errors="replace"，
+    保证编码问题不会再变成启动崩溃。reconfigure 不可用时静默跳过，
+    由各处的 print(f"... {e!r}") 安全写法兜底。"""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_force_utf8_streams()
+
+
 def main():
     """主启动函数"""
     print("=" * 60)
@@ -21,10 +40,10 @@ def main():
     for module in required_modules:
         try:
             __import__(module)
-            print(f"✓ {module} 已安装")
+            print(f"[OK] {module} 已安装")
         except ImportError:
             missing_modules.append(module)
-            print(f"✗ {module} 未安装")
+            print(f"[MISSING] {module} 未安装")
     
     if missing_modules:
         print(f"\n缺少必要模块: {', '.join(missing_modules)}")
@@ -91,7 +110,7 @@ def main():
         print("\n\n操作已取消")
         return 0
     except Exception as e:
-        print(f"启动失败: {e}")
+        print(f"启动失败: {e!r}")
         return 1
     
     return 0

@@ -31,12 +31,18 @@ REBALANCE_FRACTION = 0.1      # 负载平衡分数
 MAX_VALID_CONCENTRATION = 500.0  # 单元浓度有效性上限(mol/L)，超过视为数值异常
 
 # ==================== 数据库路径配置 ====================
-DATABASE_PATHS = [
-    r"C:\phreeqc\database\phreeqc.dat",
-    r"C:\Program Files\USGS\phreeqc\database\phreeqc.dat",
-    r"phreeqc.dat",
-    "phreeqc.dat"
-]
+# 【修复 b6】这里原来另有一份候选列表（含两条裸 "phreeqc.dat"，按 cwd 解析），
+# 与 phreeqc_config.DATABASE_PATHS 内容不同 —— 同一件事有两个真相，
+# 导致"运行时用系统库、pytest 用仓库库"这种双源结果。
+# 现在唯一真源在 phreeqc_config（决策 D2：仓库根优先，系统路径只作 fallback，
+# 且解析一律 __file__ 基，不再随 cwd 漂移）。本名字仅为兼容旧导入保留。
+from phreeqc_config import (  # noqa: E402
+    REPO_DATABASE_PATH,
+    SYSTEM_DATABASE_PATHS,
+    find_phreeqc_database,
+)
+
+DATABASE_PATHS = [REPO_DATABASE_PATH] + SYSTEM_DATABASE_PATHS
 
 # ==================== 溶液定义 ====================
 INITIAL_SOLUTIONS = {
@@ -65,11 +71,28 @@ INITIAL_SOLUTIONS = {
 def initialize_phreeqcrm():
     """
     初始化PhreeqcRM实例
-    
+
+    【收尾 2 —— 领队 seq 26 二.2】接入 rm 台账。
+    本函数目前**没有生产调用方**（全仓库只有 phreeqc_config:606 把同名符号
+    指向 create_fully_initialized_phreeqcrm，真正的 rm 创建走
+    phreeqc_config.create_robust_phreeqcrm_instance /
+    coupled_chemistry_physics_gui._setup_phreeqcrm_for_coupled_sim，两者都已登记）。
+    领队裁决：这条路径**不删**，但必须过台账 —— 否则将来任何一处调用它，
+    就会绕过"同进程只允许一个存活 rm"的守卫（决策 D7），而守卫是 exit 139
+    的唯一 Python 层防线（require_rm_mapped 的说明里记着实测）。
+    这里用函数内延迟导入：utils 是叶子模块，phreeqc_config 依赖它，
+    顶层反向 import 会成环。
+
     Returns:
         PhreeqcRM: 配置好的PhreeqcRM实例
+
+    Raises:
+        RuntimeError: 本进程已有存活的 PhreeqcRM（台账硬失败，不静默造第二个）
     """
+    from phreeqc_config import _register_rm
+
     rm = PhreeqcRM(NXYZ, NTHREADS)
+    _register_rm(rm, "utils.initialize_phreeqcrm", nxyz=NXYZ, nthreads=NTHREADS)
     
     # 设置基本配置
     rm.SetErrorOn(True)
@@ -86,25 +109,36 @@ def initialize_phreeqcrm():
 
 def load_database(rm):
     """
-    尝试加载Phreeqc数据库
-    
+    加载 Phreeqc 数据库
+
+    【决策 D2 / 修复 b6】原来这里是"遍历 DATABASE_PATHS 逐个 try，全失败就
+    打印'将尝试使用InitialPhreeqc定义组件'然后 return False"。那有两重问题：
+      1) 候选表与 phreeqc_config 的那份是两份，且按 cwd 解析，命中哪个取决于
+         从哪里启动 —— 这正是"仓库版 vs 系统版 phreeqc.dat 双真源"的来源；
+      2) 失败后继续跑，让 FindComponents 拿到一个组分集合不完整/为空的 rm，
+         后面 RunCells 直接以 exit 127 崩掉。
+    现在只问 phreeqc_config.find_phreeqc_database() 要那一个路径（仓库根优先，
+    系统安装路径仅作 fallback），并把失败原样回报给调用方，由调用方硬失败。
+
     Args:
         rm (PhreeqcRM): PhreeqcRM实例
-        
+
     Returns:
         bool: 是否成功加载数据库
     """
-    for db_path in DATABASE_PATHS:
-        try:
-            rm.LoadDatabase(db_path)
-            print(f"   成功加载数据库: {db_path}")
-            return True
-        except Exception as e:
-            continue
-    
-    print("   警告: 无法加载标准数据库文件")
-    print("   将尝试使用InitialPhreeqc定义组件...")
-    return False
+    from phreeqc_config import find_phreeqc_database
+
+    db_path = find_phreeqc_database()
+    if not db_path:
+        print("   错误: 找不到 phreeqc.dat（仓库根与系统安装位置都试过）")
+        return False
+    try:
+        rm.LoadDatabase(db_path)
+        print(f"   成功加载数据库: {db_path}")
+        return True
+    except Exception as e:
+        print(f"   错误: 加载 {db_path} 失败: {e!r}")
+        return False
 
 def configure_physical_parameters(rm):
     """
@@ -132,30 +166,6 @@ def configure_physical_parameters(rm):
     
     # 减少化学输出以提高性能
     rm.SetPrintChemistryOn(False, False, False)
-
-def assign_initial_solutions(rm):
-    """
-    为网格分配初始溶液
-    
-    Args:
-        rm (PhreeqcRM): PhreeqcRM实例
-    """
-    for i in range(NXYZ):
-        z_idx = i // (NX * NY)
-        remaining = i % (NX * NY)
-        y_idx = remaining // NX
-        x_idx = remaining % NX
-        
-        # 左上角前层区域 (酸性源)
-        if x_idx < NX//3 and y_idx < NY//3 and z_idx < NZ//3:
-            rm.InitialPhreeqcCell2Module(INITIAL_SOLUTIONS['acidic']['number'], [i])
-        # 右下角后层区域 (碱性源)
-        elif x_idx > 2*NX//3 and y_idx > 2*NY//3 and z_idx > 2*NZ//3:
-            rm.InitialPhreeqcCell2Module(INITIAL_SOLUTIONS['alkaline']['number'], [i])
-        else:  # 其他位置使用背景溶液
-            rm.InitialPhreeqcCell2Module(INITIAL_SOLUTIONS['background']['number'], [i])
-    
-    print("   初始溶液已分配: 左上角 = 酸性源, 右下角 = 碱性源, 其余 = 背景")
 
 def get_solution_definition():
     """

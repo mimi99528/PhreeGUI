@@ -5,6 +5,24 @@
 """
 
 import sys
+
+
+def _force_utf8_streams():
+    """见 launch_coupled_simulation.py 中同名函数：
+    子进程独立继承控制台句柄，必须自己再配置一次，
+    否则 GBK 控制台下中文字符串 print 会抛 UnicodeEncodeError。"""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_force_utf8_streams()
+
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QSurfaceFormat
 
@@ -68,7 +86,7 @@ def main():
         return app.exec()
         
     except Exception as e:
-        print(f"程序运行出错: {e}")
+        print(f"程序运行出错: {e!r}")
         import traceback
         traceback.print_exc()
         return 1

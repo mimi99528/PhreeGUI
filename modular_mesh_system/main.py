@@ -5,6 +5,24 @@ Modular Mesh Reconstruction System - Main Entry Point
 """
 
 import sys
+
+
+def _force_utf8_streams():
+    """见 launch_coupled_simulation.py 中同名函数说明。
+    本文件作为 python -m modular_mesh_system.main 启动时是独立进程，
+    必须自行配置，否则 GBK 控制台下中文 print 会抛 UnicodeEncodeError。"""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_force_utf8_streams()
+
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QSurfaceFormat
 
@@ -44,7 +62,7 @@ def main():
         return exit_code
         
     except Exception as e:
-        print(f"程序启动失败: {e}")
+        print(f"程序启动失败: {e!r}")
         import traceback
         traceback.print_exc()
         return 1
