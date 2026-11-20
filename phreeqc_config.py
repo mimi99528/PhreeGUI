@@ -128,7 +128,20 @@ DEFAULT_NX = 6
 DEFAULT_NY = 6
 DEFAULT_NZ = 6
 DEFAULT_NXYZ = DEFAULT_NX * DEFAULT_NY * DEFAULT_NZ
-DEFAULT_NTHREADS = 1
+# PhreeqcRM 的 OpenMP 线程数。【上限 4，不要上调】
+# 前提：必须是打过线程补丁的 wheel。原版 0.0.17/0.0.20 在 nt>1 时 RunCells 内
+#   SIGSEGV(139)：CreateMapping 改 count_chemistry 后 SetEndCells 只重算均分区间、
+#   不搬单元，worker 拿到自己不持有的 cell，Get_solution(j) 返回 NULL，而 release
+#   构建把 assert 编译掉了。补丁另修：搬迁归属判据、nthreads>count_chemistry 的
+#   非法硬失败、以及 RunCellsThread 全程持 GIL 导致化学串行。
+#   补丁 D:\tmp_pg_verify\rm_build\phreeqcrm-thread-fix.v3.patch（3 文件 9 hunk）；
+#   原版 0.0.17 备份 D:\tmp_pg_verify\venv_backup_017\（换回原版必须同时改回 1）。
+# 本机 16 逻辑核实测（两条路径分开报，别混用）：
+#   恒等映射 1000 单元 45.93→14.42ms(3.19×)，216 单元 9.81→4.05ms(2.42×)；
+#   GUI 真实稀疏路径（每帧 n_sig 2~97）3.34→2.24ms(1.49×)，nt=2 为 2.20ms，
+#   两者在噪声内持平；nt=8 稀疏反而退化到 2.84ms 且 CPU 翻倍。
+#   两条路径各 nt 化学末态与 nt=1 均逐位相同（ndiff=0）。
+DEFAULT_NTHREADS = 4
 
 # ==================== 数据库路径（决策 D2：唯一真源 = 仓库根 phreeqc.dat）====================
 # 原状态（已实测确证）：phreeqc_config.DATABASE_PATHS 与 utils.DATABASE_PATHS 是两份
@@ -202,12 +215,21 @@ def require_components(rm) -> List[str]:
 
 # 决策 D6：中性水的元素总量（mol/L），键必须是"真实组分名"。
 # 55.35 mol/L = 1000/18.015（水的摩尔浓度）；H 元素 = 2 × 55.34 ≈ 110.68。
-# 旧代码里的 1.433e-25 全仓库无出处，已按 D6 弃用。
+#
+# 【实测补充，本轮新增】H=110.68 比 2×O=110.70 少 0.02 mol/L，这 0.02 在
+# PHREEQC 里以溶解氧的形式出现：实测 pH 6.997 / pe 13.94 / O2 5.0e-3 mol/L
+# （探针 _probe_chem_species10）。也就是说本表描述的是"含溶解氧的水"。
+# 这个值不能随手改成 H=2×O：无氧水实测 pe≈-2 ~ -8，碳酸水会有一半碳被还原
+# 成 CH4（_probe_chem_species11），碳酸盐平衡示例直接失真。
+# 因此保留 110.68 作为氧化性基线，新液体都在这个基线上叠加；只有"亚铁水"
+# 故意用 H=2×O 造无氧环境（见 FERROUS_WATER_COMPOSITION 的注释）。
 NEUTRAL_WATER_COMPOSITION = {
     'H': 110.68,
     'O': 55.35,
     'Charge': 0.0,
+    'C': 0.0,
     'Cl': 0.0,
+    'Fe': 0.0,
     'Na': 0.0,
 }
 
@@ -221,7 +243,9 @@ ACIDIC_WATER_COMPOSITION = {
     'H': 110.68 + 1.0e-3,
     'O': 55.35,
     'Charge': 0.0,
+    'C': 0.0,
     'Cl': 1.0e-3,
+    'Fe': 0.0,
     'Na': 0.0,
 }
 
@@ -230,14 +254,89 @@ ALKALINE_WATER_COMPOSITION = {
     'H': 110.68 + 1.0e-3,
     'O': 55.35 + 1.0e-3,
     'Charge': 0.0,
+    'C': 0.0,
     'Cl': 0.0,
+    'Fe': 0.0,
     'Na': 1.0e-3,
+}
+
+# ── 示例场景用液体（4..7）───────────────────────────────────────────────
+# 以下数值全部由 _probe_chem_species10 按生产路径（CreateMapping + RunCells）
+# 实测核对过，括号里是实测结果，不是理论估算。
+
+# 4 碳酸水：CO2 1e-3 mol/L。
+#   实测 pH 4.68 / pe 16.24；碳形态 CO2 9.82e-4、HCO3- 2.1e-5、CO3-2 5e-11。
+#   即"纯 CO2 溶于水"，酸性来自碳酸自身解离，不是外加酸。
+CARBONIC_WATER_COMPOSITION = {
+    'H': 110.68,
+    'O': 55.35,
+    'Charge': 0.0,
+    'C': 1.0e-3,
+    'Cl': 0.0,
+    'Fe': 0.0,
+    'Na': 0.0,
+}
+
+# 5 碳酸氢钠水：NaHCO3 1e-3 mol/L（Na 与 C 各 1e-3）。
+#   实测 pH 8.27 / pe 12.63；碳形态 HCO3- 9.82e-4、CO3-2 9.5e-6、CO2 1.1e-5。
+#   H 额外 +1e-3 是 HCO3- 自带的那一个氢，不能省（省掉会变成 Na2CO3 的碱性水）。
+BICARBONATE_WATER_COMPOSITION = {
+    'H': 110.68 + 1.0e-3,
+    'O': 55.35,
+    'Charge': 0.0,
+    'C': 1.0e-3,
+    'Cl': 0.0,
+    'Fe': 0.0,
+    'Na': 1.0e-3,
+}
+
+# 6 亚铁水：FeCl2 1e-3 mol/L，故意做成无氧。
+#   H 取恰好 2×O=110.70（不留氧），实测 pH 6.29 / pe -1.96 / O2 0，
+#   Fe 全部以 Fe2+ 存在（1.0e-3），没有 Fe(OH)3 沉淀。
+#   这就是"地下水里的二价铁"：一旦遇到含氧水（液体 7），pe 升到 +17，
+#   Fe2+ 被氧化成 Fe3+ 并水解沉淀，溶解态铁降到 ~1e-5（见 6+7 混合实测）。
+FERROUS_WATER_COMPOSITION = {
+    'H': 110.70,
+    'O': 55.35,
+    'Charge': 0.0,
+    'C': 0.0,
+    'Cl': 2.0e-3,
+    'Fe': 1.0e-3,
+    'Na': 0.0,
+}
+
+# 7 曝气水：在中性水基线上把 O 再加 1e-3，多出来的氧以溶解氧存在。
+#   实测 pH 7.00 / pe 13.95 / O2 5.5e-3（中性水本身已有 5.0e-3）。
+AERATED_WATER_COMPOSITION = {
+    'H': 110.68,
+    'O': 55.35 + 1.0e-3,
+    'Charge': 0.0,
+    'C': 0.0,
+    'Cl': 0.0,
+    'Fe': 0.0,
+    'Na': 0.0,
 }
 
 WATER_COMPOSITIONS = {
     1: NEUTRAL_WATER_COMPOSITION,
     2: ACIDIC_WATER_COMPOSITION,
     3: ALKALINE_WATER_COMPOSITION,
+    4: CARBONIC_WATER_COMPOSITION,
+    5: BICARBONATE_WATER_COMPOSITION,
+    6: FERROUS_WATER_COMPOSITION,
+    7: AERATED_WATER_COMPOSITION,
+}
+
+# 液体类型 → 界面显示名。GUI 的 Ctrl+滚轮切换、液体标签都用这一张表，
+# 不再在三个地方各写一份 ["水", "酸性溶液", "碱性溶液"]。
+FLUID_TYPE_NAMES = {
+    1: "水",
+    2: "酸性溶液 (HCl)",
+    3: "碱性溶液 (NaOH)",
+    4: "碳酸水 (CO₂)",
+    5: "碳酸氢钠水 (NaHCO₃)",
+    6: "亚铁水 (Fe²⁺)",
+    7: "曝气水 (O₂)",
 }
 
 
@@ -396,10 +495,45 @@ def setup_default_chemical_system(rm: PhreeqcRM) -> bool:
             units mol/L
             Na 0.01 as NaOH
         END
+
+        # 4..7 只用来让 FindComponents 把 C / Fe 登记成组分（粒子播种需要
+        # SetConcentrations 里有这两列），同时作为液体 4..7 的可读定义。
+        # 启动时 1000 个单元仍然全部铺 SOLUTION 1（决策 D8），这几条不会被
+        # 分配给任何单元。
+        SOLUTION 4 Carbonic
+            units mol/L
+            temp 25.0
+            pH 5.6 charge
+            C 1.0e-3
+        END
+
+        SOLUTION 5 Bicarbonate
+            units mol/L
+            temp 25.0
+            pH 8.3 charge
+            C 1.0e-3
+            Na 1.0e-3
+        END
+
+        SOLUTION 6 Ferrous
+            units mol/L
+            temp 25.0
+            pH 5.0 charge
+            Fe(2) 1.0e-3
+        END
+
+        SOLUTION 7 Aerated
+            units mol/L
+            temp 25.0
+            pH 7.0 charge
+            O(0) 1.0e-3
+        END
         
         SELECTED_OUTPUT 1
             -reset false
             -pH
+            -pe
+            -molalities CO2 HCO3- CO3-2 Fe+2 Fe+3 O2
         END
         """
         

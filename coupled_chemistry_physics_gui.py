@@ -22,7 +22,7 @@ import logging
 import math
 import traceback
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 
 
@@ -57,7 +57,7 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 # 项目模块导入
 try:
-    from modular_mesh_system.core.mesh_system import MeshSystem
+    from modular_mesh_system.core.mesh_factory import create_mesh_system
     from modular_mesh_system.renderer.opengl_renderer import OpenGLRenderer
     from modular_mesh_system.utils.config import CONFIG
     from modular_mesh_system.utils.helpers import calculate_camera_position
@@ -73,6 +73,13 @@ except ImportError as e:
     print(f"警告: 无法导入耦合仿真模块: {e}")
     COUPLED_SIM_AVAILABLE = False
 
+try:
+    from phreeqc_config import FLUID_TYPE_NAMES, WATER_COMPOSITIONS
+except ImportError as e:
+    print(f"警告: 无法导入 phreeqc_config: {e}")
+    FLUID_TYPE_NAMES = {1: "水", 2: "酸性溶液 (HCl)", 3: "碱性溶液 (NaOH)"}
+    WATER_COMPOSITIONS = {1: None, 2: None, 3: None}
+
 # 配置日志：默认 INFO；诊断时用 PHREEGUI_LOG_LEVEL=DEBUG 启动
 logging.basicConfig(
     level=getattr(logging, os.environ.get("PHREEGUI_LOG_LEVEL", "INFO").upper(),
@@ -82,12 +89,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ChemicalScenario:
-    """化学反应场景配置"""
+    """化学反应场景配置。
+
+    fluid_types 决定这个场景下 Ctrl+滚轮能切到哪些液体（只影响**新生成**的
+    粒子，已有粒子的化学状态保持不动）；field_kind 决定分布图显示哪个量。
+    """
     name: str
     description: str
     initial_conditions: Dict
     parameters: Dict
     chemical_components: List[str]
+    fluid_types: List[int] = field(default_factory=lambda: [1, 2, 3])
+    default_fluid_type: int = 1
+    field_kind: str = "solute"
 
 class ChemistryVisualizationWidget(QWidget):
     """化学浓度可视化组件"""
@@ -103,6 +117,9 @@ class ChemistryVisualizationWidget(QWidget):
         self._colorbar_img = None   # 预渲染的色条
         self._min_val = 0.0
         self._max_val = 0.0
+        # 标题里的指标名：场景决定看「溶质浓度 / pH / 溶解态铁 …」，
+        # 不能让三个场景都用同一句「化学场分布」，否则看不出区别。
+        self._field_label = "化学场"
 
     _LUT = None  # 256 级颜色查找表（首次使用时构建）
 
@@ -146,7 +163,7 @@ class ChemistryVisualizationWidget(QWidget):
 
         painter.setPen(QPen(QColor(255, 255, 255)))
         painter.setFont(QFont("Arial", 10, QFont.Bold))
-        painter.drawText(margin, 15, "化学场分布（X–Z 平面）")
+        painter.drawText(margin, 15, f"{self._field_label}（X–Z 平面）")
         painter.setFont(QFont("Arial", 8))
         painter.setPen(QPen(QColor(180, 180, 180)))
         painter.drawText(margin, margin + height + 14, "X →")
@@ -177,6 +194,14 @@ class ChemistryVisualizationWidget(QWidget):
         self.concentration_data = np.zeros((50, 50))
         self._image = None
         self._image_rgb = None
+        self.update()
+
+    def set_field_label(self, name: str):
+        """设置分布图标题里的指标名（场景切换时由主窗口调用）。"""
+        name = (name or "").strip()
+        if not name or name == self._field_label:
+            return
+        self._field_label = name
         self.update()
 
     # 无数据单元（NaN）用中性灰，和「蓝→绿→红」色带明显区分
@@ -259,6 +284,10 @@ class SimulationWorker(QObject):
         # 水面看起来像慢动作糖浆；默认 3 子步 ≈ 0.54× 实时，可在调试面板实时调。
         self.physics_substeps = 3
         self.simulation_timer = None  # 在 worker 线程的 start_simulation 里创建
+
+        # 分布图指标：由场景决定（'solute' / 'ph' / 'Fe' / 'C' 或组分名）。
+        # 默认为 'solute'，主窗口切换场景时通过 worker_field_kind_requested 改。
+        self.field_kind = "solute"
 
         # 【决策 D9】pH 账目。闭合式：
         #   frames_emitted + frames_no_data_at_all + fetch_failed
@@ -457,20 +486,31 @@ class SimulationWorker(QObject):
                 # 所以永远是"一片均匀色、不像真实分布"。
                 # 现在改用 get_2d_field()：
                 #   - 'solute' = 真实溶质(Cl/Na/…)在 X-Z 平面上沿 Y 的柱积分；
-                #   - 若整杯只有纯水（无溶质）再退到 'ph' 场（按柱取最偏离 7 的 pH）。
-                # 波峰/波谷来自粒子在格子里的实际落点，因此才是空间分布。
+                #   - 'ph'     = 按柱取最偏离 7 的 pH（酸碱中和 / 碳酸盐场景）；
+                #   - 'Fe+2' / 'C' = SelectedOutput 里该物种 / 组分的柱积分
+                #                    （氧化还原场景看亚铁被氧化掉）。
+                # 具体看哪个量由场景决定（self.field_kind），主窗口切换场景时改。
+                # 只有 'solute' 这一种"自动挑溶质"的指标在主场景没溶质时退到
+                # 'ph'；显式指定的指标即使整场接近 0 也照实画（那是真实结果）。
                 if hasattr(self.coupled_sim, 'get_2d_field'):
                     try:
-                        field = self.coupled_sim.get_2d_field('solute')
-                        usable = (field is not None and field.size > 0
-                                  and np.any(np.isfinite(field))
-                                  and float(np.nanmax(np.abs(field))) > 1e-9)
-                        if not usable and hasattr(self.coupled_sim, 'get_2d_field'):
-                            ph_field = self.coupled_sim.get_2d_field('ph')
-                            if (ph_field is not None and ph_field.size > 0
-                                    and np.any(np.isfinite(ph_field))):
-                                field = ph_field
-                                usable = True
+                        kind = getattr(self, 'field_kind', 'solute') or 'solute'
+                        field = self.coupled_sim.get_2d_field(kind)
+                        has_finite = (field is not None and field.size > 0
+                                      and np.any(np.isfinite(field)))
+                        if kind == 'solute':
+                            # 纯水场景没有溶质：整场 0 画出来是"一片假热区"，
+                            # 这时才退到 pH。显式指定的指标（ph / Fe+2 / C …）
+                            # 即使数值很小也是真实结果，不许被替换掉标题。
+                            usable = (has_finite
+                                      and float(np.nanmax(np.abs(field))) > 1e-9)
+                            if not usable:
+                                logger.debug("分布场 solute 本帧无溶质，退到 pH 场")
+                                field = self.coupled_sim.get_2d_field('ph')
+                                usable = (field is not None and field.size > 0
+                                          and np.any(np.isfinite(field)))
+                        else:
+                            usable = has_finite
                         if usable:
                             self.concentration_updated.emit(
                                 np.asarray(field, dtype=np.float64))
@@ -602,6 +642,17 @@ class SimulationWorker(QObject):
         """设置每 UI 帧的物理子步数（worker 线程执行，下一 tick 即生效）。"""
         self.physics_substeps = max(1, min(8, int(n)))
 
+    @Slot(str)
+    def set_field_kind(self, kind: str):
+        """设置分布图取哪个量（worker 线程执行，下一 tick 即生效）。
+
+        切换场景只改"之后画什么"，不动化学状态、不重建 PhreeqcRM。
+        """
+        kind = (kind or "").strip()
+        if not kind:
+            return
+        self.field_kind = kind
+
     def cleanup(self):
         """清理资源。必须在本对象所属线程调用（主窗口用 BlockingQueuedConnection）。"""
         self.stop_simulation()
@@ -625,9 +676,10 @@ class SimulationWorker(QObject):
             if self.coupled_sim is None:
                 raise RuntimeError("化学耦合系统未初始化，拒绝只生成没有化学的粒子")
 
-            if fluid_type not in (1, 2, 3):
+            if int(fluid_type) not in WATER_COMPOSITIONS:
                 raise RuntimeError(
-                    f"未知的流体类型: {fluid_type!r}（合法值 1=中性水/2=酸性/3=碱性）")
+                    f"未知的流体类型: {fluid_type!r}（合法值 "
+                    f"{sorted(WATER_COMPOSITIONS)}，见 phreeqc_config.WATER_COMPOSITIONS）")
 
             count = int(count)
             if count < 1:
@@ -636,7 +688,7 @@ class SimulationWorker(QObject):
                 raise RuntimeError(
                     f"单次最多生成 {self.SPAWN_MAX_COUNT} 个粒子（收到 {count}）；"
                     "超过这个量实测会把水打飞，需要更多请分多次点击")
-            capacity = int(mesh_system.pysplish_fluid_model.numParticles())
+            capacity = int(mesh_system.capacity())
             active = int(mesh_system.current_particle_num)
             if active + count > capacity:
                 raise RuntimeError(
@@ -728,6 +780,15 @@ class SimulationWorker(QObject):
     # 的盒盖、3000 帧里 2294 帧超速；底面抬到 h=4r 后 maxY 0.19 m。
     SPAWN_CLEARANCE = 4.0    # 出生底面离地板的最小高度（以半径为单位的 h）
 
+    # 侧墙安全间距。实测（Taichi/Akinci2012 边界粒子，+x 墙层在 x=0.78，
+    # 静止密度 1000、容器中心孤立粒子 254）出生密度随"到墙粒子层的距离"
+    # 变化：1r→2768、2r→1273、3r→592、4r→510。旧 clip 值 bmax-radius 恰好
+    # 是 1r，而空场点击的落点就在前墙面上，于是点阵外沿压在墙粒子层上：
+    # 实测 8 个粒子 spawn rho_max=3747、第一步 max|v|=738 m/s，整团飞出容器。
+    # Taichi 墙块厚 2r、墙粒子层在 AABB 面内缩 2r，所以从面算起要留 2r+3r。
+    SPAWN_WALL_CLEARANCE = 3.0   # 到墙粒子层的最小距离（以半径为单位）
+    SPAWN_WALL_INSET = 2.0       # 墙粒子层相对容器 AABB 面的内缩（以半径为单位）
+
     # 每块灌注的粒子数上限（按整层取整，实际值可能略大）。
     # 单块越小越温和；块间跑 SPAWN_SETTLE_STEPS 帧物理让它落定。
     SPAWN_CHUNK_TARGET = 2000
@@ -739,6 +800,15 @@ class SimulationWorker(QObject):
     #   有粒子跑出容器）。这个上限取在实测安全区的上沿，再多请分多次点击。
     SPAWN_MAX_COUNT = 20000
 
+    def _spawn_wall_margin(self) -> float:
+        """粒子中心到容器 AABB 面的最小距离（米），点阵足迹整体不得越界。
+
+        按 Taichi 墙粒子层的真实位置取（面内缩 2r）再加 3r 安全距离。
+        CPU 后端的墙面就在 AABB 面上，这个值只是更保守一些。
+        """
+        radius = float(CONFIG.PARTICLE_RADIUS)
+        return (self.SPAWN_WALL_INSET + self.SPAWN_WALL_CLEARANCE) * radius
+
     def _lattice_plan(self, count: int, mesh_system) -> Tuple[int, float]:
         """返回正方点阵的每层边长 n_xy 与半宽 half（米）。
 
@@ -747,7 +817,7 @@ class SimulationWorker(QObject):
         """
         spacing = float(getattr(mesh_system, 'particle_spacing',
                                 CONFIG.PARTICLE_SPACING))
-        radius = float(CONFIG.PARTICLE_RADIUS)
+        margin = self._spawn_wall_margin()
         bmin = np.asarray(mesh_system.boundary_min, dtype=np.float64)
         bmax = np.asarray(mesh_system.boundary_max, dtype=np.float64)
         count = int(count)
@@ -757,16 +827,18 @@ class SimulationWorker(QObject):
             n_xy += 1
         half = 0.5 * (n_xy - 1) * spacing
 
-        max_half_x = 0.5 * (bmax[0] - bmin[0]) - radius
-        max_half_z = 0.5 * (bmax[2] - bmin[2]) - radius
+        max_half_x = 0.5 * (bmax[0] - bmin[0]) - margin
+        max_half_z = 0.5 * (bmax[2] - bmin[2]) - margin
         if half > max_half_x or half > max_half_z:
             n_xy = int(np.ceil(np.sqrt(count)))
             half = 0.5 * (n_xy - 1) * spacing
             if half > max_half_x or half > max_half_z:
                 raise RuntimeError(
                     f"{count} 个粒子放不进容器：单层需要 "
-                    f"{2 * half:.2f}×{2 * half:.2f} m，容器只有 "
-                    f"{bmax[0] - bmin[0]:.2f}×{bmax[2] - bmin[2]:.2f} m")
+                    f"{2 * half:.2f}×{2 * half:.2f} m，扣除侧墙安全间距后"
+                    f"只有 {2 * max_half_x:.2f}×{2 * max_half_z:.2f} m"
+                    f"（容器 {bmax[0] - bmin[0]:.2f}×"
+                    f"{bmax[2] - bmin[2]:.2f} m）")
         return n_xy, half
 
     def _build_lattice_particles(self, mesh_system, anchor: np.ndarray,
@@ -776,6 +848,9 @@ class SimulationWorker(QObject):
 
         落点规则：
         - 底面高度不低于 bmin + 4r（见 SPAWN_CLEARANCE）。
+        - x/z 足迹整体离侧墙至少 SPAWN_WALL_INSET+SPAWN_WALL_CLEARANCE 个半径
+          （见 _spawn_wall_margin）：空场点击的落点就在墙面上，贴墙出生会与
+          边界粒子重叠，首帧密度暴涨后被压力弹飞。
         - 只认"本批足迹内"的料堆顶。以前回看半宽 + 1 个间距，会把刚生成、
           还在下落的那一批也算成料堆：连续快速点击时出生点一次比一次高
           （实测 25 次点击爬到 0.46 m），最后几批从高处砸进水里，水面
@@ -797,11 +872,12 @@ class SimulationWorker(QObject):
             n_xy, _ = self._lattice_plan(count, mesh_system)
         n_layers = int(np.ceil(count / float(n_xy * n_xy)))
         half = 0.5 * (n_xy - 1) * spacing
+        margin = self._spawn_wall_margin()
 
-        cx = float(np.clip(anchor[0], bmin[0] + radius + half,
-                           bmax[0] - radius - half))
-        cz = float(np.clip(anchor[2], bmin[2] + radius + half,
-                           bmax[2] - radius - half))
+        cx = float(np.clip(anchor[0], bmin[0] + margin + half,
+                           bmax[0] - margin - half))
+        cz = float(np.clip(anchor[2], bmin[2] + margin + half,
+                           bmax[2] - margin - half))
 
         base_y = float(bmin[1] + self.SPAWN_CLEARANCE * radius)
         max_base = float(bmax[1] - radius - (n_layers - 1) * spacing)
@@ -850,9 +926,11 @@ class SimulationWorker(QObject):
         lattice[:, 1] += base_y
         lattice[:, 2] += cz
 
-        lattice[:, 0] = np.clip(lattice[:, 0], bmin[0] + radius, bmax[0] - radius)
+        # 兜底：上面的 cx/cz 已保证整块足迹在安全区内，这里只防浮点溢出。
+        # 阈值必须与生成边界一致，否则会把粒子推回墙粒子层上。
+        lattice[:, 0] = np.clip(lattice[:, 0], bmin[0] + margin, bmax[0] - margin)
         lattice[:, 1] = np.clip(lattice[:, 1], bmin[1] + radius, bmax[1] - radius)
-        lattice[:, 2] = np.clip(lattice[:, 2], bmin[2] + radius, bmax[2] - radius)
+        lattice[:, 2] = np.clip(lattice[:, 2], bmin[2] + margin, bmax[2] - margin)
         return lattice.astype(np.float32)
 
 class CoupledSimulationMainWindow(QMainWindow):
@@ -865,6 +943,7 @@ class CoupledSimulationMainWindow(QMainWindow):
     worker_stop_requested = Signal()
     worker_speed_requested = Signal(float)
     worker_substeps_requested = Signal(int)
+    worker_field_kind_requested = Signal(str)
     worker_cleanup_requested = Signal()
 
     def __init__(self):
@@ -898,13 +977,37 @@ class CoupledSimulationMainWindow(QMainWindow):
         # 先把 rm 建好，worker 线程启动时读到的必然是可用的实例。
         self.initialize_chemistry_system()
         self.setup_simulation_thread()
+
+        # 【性能】渲染与物理解耦。原来 paintGL 只由 worker 的 particles_updated
+        # 信号触发，而 10k 粒子时一个 worker tick 实测 ~160ms（化学 ~95ms 串行
+        # + 物理 3×~20ms），界面帧率被仿真帧率绑架到 ~6fps。这里用独立的 60fps
+        # 定时器驱动重绘，worker 信号只负责更新 VBO 数据；仿真慢时界面依然流畅。
+        # 注意：粒子运动的平滑度仍受物理帧率限制，本改动解决的是 UI/相机卡顿。
+        self.render_timer = QTimer(self)
+        self.render_timer.setInterval(16)
+        self.render_timer.timeout.connect(self._render_tick)
         
     def create_scenarios(self) -> List[ChemicalScenario]:
-        """创建预定义化学反应场景"""
+        """创建预定义化学反应场景。
+
+        每个场景都绑定到 phreeqc_config.WATER_COMPOSITIONS 里的真实液体类型，
+        数值来自 _probe_chem_species10 的实测（生产路径 CreateMapping+RunCells）：
+          1 中性水   pH 6.997 / pe 13.94
+          2 酸性 HCl pH 3.014 / pe 17.93
+          3 碱性 NaOH pH 10.98 / pe 9.96
+          4 碳酸水   pH 4.680，碳形态 CO2 9.8e-4（占 98%）
+          5 碳酸氢钠 pH 8.269，碳形态 HCO3- 9.8e-4（占 98%）
+          6 亚铁水   pH 6.291 / pe -1.96，Fe 全部是 Fe2+（无沉淀）
+          7 曝气水   pH 6.997 / pe 13.95，O2 5.5e-3
+        6+7 混合实测 pH 3.61 / pe 17.26：Fe2+ 被氧化成 Fe3+，溶解态铁
+        从 5e-4 降到 ~1e-5（其余水解成 Fe(OH)3 沉淀）。
+        """
         return [
             ChemicalScenario(
                 name="酸碱中和",
-                description="HCl + NaOH → NaCl + H₂O",
+                description="HCl + NaOH → NaCl + H₂O\n"
+                            "Ctrl+滚轮在 水/酸性/碱性 之间切换；"
+                            "两种水在同一化学单元里相遇即按电荷平衡重新计算 pH。",
                 initial_conditions={
                     "left_concentration": 0.01,  # 左侧H+浓度
                     "right_concentration": 0.01, # 右侧OH-浓度
@@ -915,11 +1018,18 @@ class CoupledSimulationMainWindow(QMainWindow):
                     "diffusion_coefficient": 1e-9,
                     "temperature": 25.0
                 },
-                chemical_components=["H+", "OH-", "Na+", "Cl-"]
+                chemical_components=["H+", "OH-", "Na+", "Cl-"],
+                fluid_types=[1, 2, 3],
+                default_fluid_type=2,
+                field_kind="ph",
             ),
             ChemicalScenario(
                 name="碳酸盐平衡",
-                description="CO₂ + H₂O ⇌ H₂CO₃ ⇌ H⁺ + HCO₃⁻",
+                description="CO₂ + H₂O ⇌ H₂CO₃ ⇌ H⁺ + HCO₃⁻ ⇌ 2H⁺ + CO₃²⁻\n"
+                            "碳酸水(4)：pH≈4.68，98% 碳以 CO₂ 存在；\n"
+                            "碳酸氢钠水(5)：pH≈8.27，98% 碳以 HCO₃⁻ 存在。\n"
+                            "两者等量混合实测 pH≈6.34，碳形态按平衡重新分配成\n"
+                            "CO₂:HCO₃⁻ ≈ 50:50。分布图画 pH：酸区与碱区之间出现过渡带。",
                 initial_conditions={
                     "co2_concentration": 1e-3,
                     "water_ph": 7.0
@@ -929,20 +1039,32 @@ class CoupledSimulationMainWindow(QMainWindow):
                     "carbonic_acid_k1": 4.3e-7,
                     "bicarbonate_k2": 5.6e-11
                 },
-                chemical_components=["CO₂", "H₂CO₃", "H+", "HCO₃⁻", "CO₃²⁻"]
+                chemical_components=["CO₂", "H₂CO₃", "H+", "HCO₃⁻", "CO₃²⁻"],
+                fluid_types=[4, 5],
+                default_fluid_type=4,
+                field_kind="ph",
             ),
             ChemicalScenario(
                 name="氧化还原反应",
-                description="Fe²⁺ + Ce⁴⁺ → Fe³⁺ + Ce³⁺",
+                description="4Fe²⁺ + O₂ + 10H₂O → 4Fe(OH)₃↓ + 8H⁺\n"
+                            "亚铁水(6)：pH≈6.29 / pe≈-2.12，Fe 全为 Fe²⁺；\n"
+                            "曝气水(7)：pH≈7.00 / pe≈+14.0，含溶解氧 O₂≈1.0e-2。\n"
+                            "混合后实测 pH≈3.61 / pe≈+17.3，Fe²⁺ 从 1e-3 降到\n"
+                            "≈4e-10（氧化成 Fe³⁺ 后水解沉淀）。\n"
+                            "分布图画「溶解态 Fe²⁺」：亚铁水那侧有颜色，被氧化处归零。\n"
+                            "注意组分总量 Fe 不会降（沉淀仍计入总量），别拿它当指标。",
                 initial_conditions={
                     "fe2_concentration": 1e-3,
-                    "ce4_concentration": 1e-3
+                    "o2_concentration": 1.0e-2
                 },
                 parameters={
-                    "redox_potential": 1.44,
+                    "redox_potential": 0.77,   # Fe3+/Fe2+ 标准电极电位 (V)
                     "reaction_order": 1.0
                 },
-                chemical_components=["Fe²⁺", "Fe³⁺", "Ce⁴⁺", "Ce³⁺"]
+                chemical_components=["Fe²⁺", "Fe³⁺", "O₂", "Fe(OH)₃"],
+                fluid_types=[6, 7],
+                default_fluid_type=6,
+                field_kind="Fe+2",
             )
         ]
     
@@ -991,6 +1113,14 @@ class CoupledSimulationMainWindow(QMainWindow):
         # 状态栏
         self.status_bar = self.statusBar()
         self.status_bar.showMessage("系统就绪 - 请选择化学反应场景")
+
+        # 【顺序修复】create_scenario_tab 里已经调过一次 on_scenario_changed，
+        # 但那时右侧面板（opengl_widget / fluid_desc_layout）还没建，
+        # 液体白名单和分布图标题都没落到位。这里在两侧面板都建好之后
+        # 按当前场景再应用一次（幂等：只改"之后生成什么水/画什么量"）。
+        combo = getattr(self, 'scenario_combo', None)
+        if combo is not None:
+            self.on_scenario_changed(combo.currentText())
     
     def create_debug_dock(self):
         """实时调试面板：滑块即改即生效，用来现场微调水的外观与流速。
@@ -1463,18 +1593,14 @@ class CoupledSimulationMainWindow(QMainWindow):
         type_info.setStyleSheet("color: #aaaaaa; font-size: 9px;")
         particle_layout.addWidget(type_info, 1, 0, 1, 2)
         
-        # 液体类型详细说明
-        fluid_descriptions = [
-            "1号液体: 水 (默认)",
-            "2号液体: 酸性溶液",
-            "3号液体: 碱性溶液"
-        ]
+        # 液体类型详细说明 —— 内容随场景白名单重建（见 _rebuild_fluid_desc_labels）。
+        # 用独立的 QVBoxLayout 承载说明行，切换场景时整块替换。
+        fluid_desc_host = QWidget()
+        self.fluid_desc_layout = QVBoxLayout(fluid_desc_host)
+        self.fluid_desc_layout.setContentsMargins(0, 0, 0, 0)
+        self.fluid_desc_layout.setSpacing(2)
+        particle_layout.addWidget(fluid_desc_host, 2, 0, 1, 2)
         self.fluid_desc_labels = []
-        for i, desc in enumerate(fluid_descriptions):
-            label = QLabel(desc)
-            label.setStyleSheet(f"color: {'#4fc3f7' if i == 0 else '#888888'}; font-size: 10px;")
-            particle_layout.addWidget(label, 2+i, 0, 1, 2)
-            self.fluid_desc_labels.append(label)
         
         # 每次点击放入的粒子数量（间距 2r 的近立方点阵）
         particle_layout.addWidget(QLabel("每次生成粒子数:"), 6, 0)
@@ -1549,7 +1675,7 @@ class CoupledSimulationMainWindow(QMainWindow):
             layout = QVBoxLayout(panel)
             
             # 创建网格系统和渲染器
-            self.mesh_system = MeshSystem()
+            self.mesh_system = create_mesh_system()
             self.opengl_renderer = OpenGLRenderer(self.mesh_system)
             
             # 创建OpenGL widget包装器
@@ -1570,7 +1696,8 @@ class CoupledSimulationMainWindow(QMainWindow):
                     self.drag_button = None
                     
                     # 粒子生成相关属性
-                    self.current_fluid_type = 1  # 当前液体类型 (1, 2, 3)
+                    self.current_fluid_type = 1  # 当前液体类型 (1..7)
+                    self.allowed_fluid_types = [1, 2, 3]  # 当前场景允许的液体
                     self.particles_per_click = 8  # 每次生成的粒子数（左侧面板可调）
                     self.is_generating_particles = False
                     self.particle_generation_timer = QTimer()
@@ -1579,7 +1706,26 @@ class CoupledSimulationMainWindow(QMainWindow):
                     
                     # 设置鼠标跟踪
                     self.setMouseTracking(True)
-                    
+                
+                def set_fluid_types(self, allowed, default=None):
+                    """限定本场景可生成哪些液体（场景切换时由主窗口调用）。
+
+                    只影响"之后点击生成什么水"：已有粒子的化学状态保持不动。
+                    当前类型不在白名单里时立刻切到默认类型，避免下一次点击
+                    生成本场景之外的液体。
+                    """
+                    allowed = [int(t) for t in allowed if t]
+                    if not allowed:
+                        return
+                    self.allowed_fluid_types = allowed
+                    if default is not None:
+                        default = int(default)
+                        self.current_fluid_type = (
+                            default if default in allowed else allowed[0])
+                    elif self.current_fluid_type not in allowed:
+                        self.current_fluid_type = allowed[0]
+                    self.update()
+
                 def initializeGL(self):
                     try:
                         import moderngl
@@ -1695,11 +1841,17 @@ class CoupledSimulationMainWindow(QMainWindow):
                     delta = event.angleDelta().y()
                     
                     if event.modifiers() & Qt.ControlModifier:
-                        # Ctrl+滚轮：切换液体类型
+                        # Ctrl+滚轮：在当前场景允许的液体类型里循环切换
+                        allowed = list(getattr(self, 'allowed_fluid_types', [1, 2, 3]))
+                        try:
+                            i = allowed.index(self.current_fluid_type)
+                        except ValueError:
+                            i = 0
                         if delta > 0:
-                            self.current_fluid_type = min(3, self.current_fluid_type + 1)
+                            i = (i + 1) % len(allowed)
                         else:
-                            self.current_fluid_type = max(1, self.current_fluid_type - 1)
+                            i = (i - 1) % len(allowed)
+                        self.current_fluid_type = allowed[i]
                         print(f"切换到液体类型 {self.current_fluid_type}")
                     else:
                         # 普通滚轮：缩放摄像机距离
@@ -1942,9 +2094,11 @@ class CoupledSimulationMainWindow(QMainWindow):
                     """
                     if not hasattr(self, 'mesh_system') or self.mesh_system is None:
                         raise RuntimeError("网格系统未初始化，无法添加粒子")
-                    if fluid_type not in (1, 2, 3):
+                    if int(fluid_type) not in WATER_COMPOSITIONS:
                         raise RuntimeError(
-                            f"未知的流体类型: {fluid_type!r}（合法值 1=中性水/2=酸性/3=碱性）")
+                            f"未知的流体类型: {fluid_type!r}（合法值 "
+                            f"{sorted(WATER_COMPOSITIONS)}，"
+                            "见 phreeqc_config.WATER_COMPOSITIONS）")
 
                     count = int(self.particles_per_click)
                     if count < 1:
@@ -2060,8 +2214,13 @@ class CoupledSimulationMainWindow(QMainWindow):
             self.simulation_worker.set_speed, Qt.QueuedConnection)
         self.worker_substeps_requested.connect(
             self.simulation_worker.set_physics_substeps, Qt.QueuedConnection)
+        self.worker_field_kind_requested.connect(
+            self.simulation_worker.set_field_kind, Qt.QueuedConnection)
         # dock 在 worker 之前创建，把调试面板里的当前值补发一次
         self.worker_substeps_requested.emit(self._physics_substeps)
+        # init_ui 阶段 worker 还不存在，场景里选的分布图指标没发出去；这里补发。
+        if self.current_scenario is not None:
+            self.worker_field_kind_requested.emit(self.current_scenario.field_kind)
         # cleanup 停的是 worker 线程的定时器，必须在 worker 线程里执行完再退线程。
         self.worker_cleanup_requested.connect(
             self.simulation_worker.cleanup, Qt.BlockingQueuedConnection)
@@ -2125,6 +2284,53 @@ class CoupledSimulationMainWindow(QMainWindow):
             
             # 更新参数控制
             self.update_scenario_parameters(selected_scenario)
+
+            # 场景只决定"之后点击生成什么水"：切换液体类型白名单 + 默认类型，
+            # 不重建 PhreeqcRM、不清场、不冻结已有粒子（用户裁决）。
+            allowed = list(selected_scenario.fluid_types)
+            if hasattr(self, 'opengl_widget') and self.opengl_widget is not None:
+                self.opengl_widget.set_fluid_types(
+                    allowed, selected_scenario.default_fluid_type)
+            if hasattr(self, 'fluid_desc_layout') and self.fluid_desc_layout is not None:
+                self._rebuild_fluid_desc_labels(allowed)
+            if hasattr(self, 'fluid_type_label') and self.fluid_type_label is not None:
+                ft = selected_scenario.default_fluid_type
+                self.fluid_type_label.setText(
+                    f"{ft} ({FLUID_TYPE_NAMES.get(ft, '?')})")
+            self._update_field_label(selected_scenario.field_kind)
+            if self.simulation_worker is not None:
+                self.worker_field_kind_requested.emit(selected_scenario.field_kind)
+
+    def _update_field_label(self, kind: str):
+        """分布图标题：把 'Fe' / 'ph' / 'solute' 翻译成用户能读懂的指标名。"""
+        labels = {
+            "solute": "溶质浓度",
+            "ph": "pH",
+            "Fe": "溶解态铁（Fe 总量）",
+            "Fe+2": "溶解态 Fe²⁺（亚铁）",
+            "Fe+3": "溶解态 Fe³⁺（三价铁）",
+            "C": "溶解态碳（C 总量）",
+        }
+        if hasattr(self, 'concentration_viz') and self.concentration_viz is not None:
+            self.concentration_viz.set_field_label(labels.get(kind, kind))
+
+    def _rebuild_fluid_desc_labels(self, allowed: List[int]):
+        """按场景的液体白名单重建右侧"液体类型"说明行。"""
+        for label in list(getattr(self, 'fluid_desc_labels', [])):
+            label.setParent(None)
+        self.fluid_desc_labels = []
+        default_ft = None
+        if getattr(self, 'current_scenario', None) is not None:
+            default_ft = self.current_scenario.default_fluid_type
+        for ft in allowed:
+            label = QLabel(f"{ft}号液体: {FLUID_TYPE_NAMES.get(ft, '?')}")
+            if ft == default_ft:
+                label.setStyleSheet(
+                    "color: #4fc3f7; font-weight: bold; font-size: 10px;")
+            else:
+                label.setStyleSheet("color: #888888; font-size: 10px;")
+            self.fluid_desc_layout.addWidget(label)
+            self.fluid_desc_labels.append(label)
     
     def update_scenario_parameters(self, scenario: ChemicalScenario):
         """更新场景参数控制界面"""
@@ -2149,6 +2355,11 @@ class CoupledSimulationMainWindow(QMainWindow):
             
             row += 1
     
+    def _render_tick(self):
+        """独立 60fps 重绘驱动（GUI 线程）。只触发 repaint，不碰仿真数据。"""
+        if getattr(self, 'opengl_widget', None) is not None:
+            self.opengl_widget.update()
+
     def start_simulation(self):
         """开始仿真 - 修复版
 
@@ -2166,6 +2377,7 @@ class CoupledSimulationMainWindow(QMainWindow):
             self.reset_btn.setEnabled(False)
 
             self.worker_start_requested.emit()
+            self.render_timer.start()
 
     def toggle_pause(self):
         """暂停/继续仿真"""
@@ -2181,6 +2393,8 @@ class CoupledSimulationMainWindow(QMainWindow):
 
         self.is_running = False
         self.is_paused = False
+        if getattr(self, 'render_timer', None) is not None:
+            self.render_timer.stop()
 
         # 更新UI状态
         self.start_btn.setEnabled(True)
@@ -2246,15 +2460,18 @@ class CoupledSimulationMainWindow(QMainWindow):
             # 更新液体类型显示
             if hasattr(self, 'opengl_widget') and hasattr(self.opengl_widget, 'current_fluid_type'):
                 fluid_type = self.opengl_widget.current_fluid_type
-                fluid_names = ["水", "酸性溶液", "碱性溶液"]
-                self.fluid_type_label.setText(f"{fluid_type} ({fluid_names[fluid_type-1]})")
-                
+                self.fluid_type_label.setText(
+                    f"{fluid_type} ({FLUID_TYPE_NAMES.get(fluid_type, '?')})")
+
                 # 更新液体类型描述颜色（只在类型变化时改样式表：
                 # setStyleSheet 每 100 ms 重解析一次 CSS 并触发 polish/重绘）
                 if fluid_type != getattr(self, '_last_fluid_type', None):
                     self._last_fluid_type = fluid_type
+                    allowed = getattr(self.opengl_widget, 'allowed_fluid_types',
+                                      [1, 2, 3])
                     for i, label in enumerate(self.fluid_desc_labels):
-                        if i == fluid_type - 1:
+                        # 说明行按 allowed 顺序排列，第 i 行对应 allowed[i]
+                        if i < len(allowed) and allowed[i] == fluid_type:
                             label.setStyleSheet("color: #4fc3f7; font-weight: bold; font-size: 10px;")
                         else:
                             label.setStyleSheet("color: #888888; font-size: 10px;")
@@ -2411,6 +2628,8 @@ class CoupledSimulationMainWindow(QMainWindow):
         # 停止摄像机更新定时器
         if hasattr(self, 'camera_update_timer'):
             self.camera_update_timer.stop()
+        if getattr(self, 'render_timer', None) is not None:
+            self.render_timer.stop()
             
         # 停止仿真线程
         # cleanup 停的是 worker 线程里的定时器，必须在 worker 线程执行；

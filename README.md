@@ -26,6 +26,24 @@ pip install -r requirements.txt
 ## 🚀 快速开始
 打开launch_coupled_simulation.py，点击开始模拟，你可以在右边的3d显示窗口看到模拟状态，使用左键来创建粒子，右键移动摄像机。
 
+### 物理后端切换（CPU / Taichi GPU）
+
+默认使用 SPlisHSPlasH CPU 版 DFSPH。启用 Taichi GPU 后端：
+
+```bash
+# 需要先安装：pip install "taichi>=1.7"
+PHREEGUI_PHYSICS_BACKEND=taichi PHREEGUI_TAICHI_ARCH=cuda python launch_coupled_simulation.py
+```
+
+| 变量 | 取值 | 说明 |
+|---|---|---|
+| `PHREEGUI_PHYSICS_BACKEND` | `cpu`（默认）/ `taichi` | 物理求解器实现 |
+| `PHREEGUI_TAICHI_ARCH` | `cuda`（默认）/ `cpu` | Taichi 执行后端 |
+
+注意：
+- 两个后端边界模型不同（CPU=Bender2019 体积图，Taichi=Akinci2012 边界粒子），数值不会逐位一致；化学耦合只依赖 (位置, 稳定粒子 id)，契约相同。
+- 后端选择失败会直接报错，不会静默降级（Taichi 未安装 / CUDA 不可用都会显式抛错）。
+
 ## 🤝 贡献
 我们欢迎各种形式的贡献！
 

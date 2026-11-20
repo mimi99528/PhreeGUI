@@ -671,6 +671,13 @@ class MeshSystem:
             
         return mesh_vertices, mesh_triangles
 
+    def capacity(self) -> int:
+        """流体粒子容量（不含边界）。后端无关的容量查询入口。"""
+        fm = self.pysplish_fluid_model
+        if fm is not None:
+            return int(fm.numParticles())
+        return int(CONFIG.MAX_EMITTER_PARTICLES)
+
     def update_mesh(self) -> Tuple[List, List]:
         """Update mesh data"""
         if not self.mesh_enabled or self.current_particle_num == 0:

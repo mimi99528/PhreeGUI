@@ -3,10 +3,27 @@
 System Configuration and Constants
 """
 
+import os
 import numpy as np
 
 class Config:
     """系统配置类"""
+
+    # ── 物理后端选择 ────────────────────────────────────────────────
+    # "cpu"    = SPlisHSPlasH DFSPH（Bender2019 体积图边界，原实现，默认）
+    # "taichi" = erizmr/SPH_Taichi DFSPH（Akinci2012 边界粒子，GPU 并行）
+    #
+    # 可用环境变量覆盖，便于不改代码切换：
+    #   PHREEGUI_PHYSICS_BACKEND=taichi
+    #   PHREEGUI_TAICHI_ARCH=cuda|cpu   （默认 cuda；CUDA 不可用时硬失败，
+    #                                    不会静默退回 CPU —— 决策 D4）
+    #
+    # 注意：两条路径的边界模型不同，数值结果不会逐位一致；
+    # 化学耦合只依赖 (position, particleId)，两者契约相同。
+    PHYSICS_BACKEND = os.environ.get(
+        "PHREEGUI_PHYSICS_BACKEND", "taichi").strip().lower()
+    TAICHI_ARCH = os.environ.get(
+        "PHREEGUI_TAICHI_ARCH", "cuda").strip().lower()
     
     # 物理仿真参数
     # SPlisHSPlasH 约定：supportRadius = 4 * particleRadius，
@@ -84,6 +101,20 @@ class Config:
     MIN_TIME_STEP = 0.001      # 1ms 最小步长
     MAX_TIME_STEP = 0.01       # 10ms 最大步长（保守上限）
     CFL_FACTOR = 0.5           # CFL条件因子（稍微放宽以提高性能）
+    # Taichi 后端没有引擎内的自适应 CFL（CPU 走 C++ TimeManager，会把
+    # 传入的步长夹回稳定区间），所以必须自己按上游公式夹一次：
+    #   SPlisHSPlasH/Simulation.cpp:487
+    #   h_cfl = cflFactor * 0.4 * diameter / sqrt(maxVel)
+    CFL_DIAMETER_FACTOR = 0.4  # 上游 CFL 公式里的 0.4 系数
+
+    # Taichi 专用的步长硬上限（与 MAX_TIME_STEP 不是一回事）。
+    # MAX_TIME_STEP=0.01 只下发给 CPU 引擎的 CFL_MAX_TIMESTEPSIZE，由引擎自己
+    # 按 CFL 再夹；Taichi 没有这层引擎保护，dt 会原样进求解器。
+    # 而显式粘性/表面张力对 dt 是刚性的，实测（8000 粒子同一灌注）：
+    #   0.003（本值）→ 稳；0.0075（2.5x）→ 峰值 2.7e4 m/s，水炸满容器；
+    #   0.015 → NaN/Inf。
+    # 所以 Taichi 路径必须先按这个上限硬夹，再做 CFL 收缩（只能更小）。
+    TAICHI_MAX_TIME_STEP = DEFAULT_TIME_STEP
     
     # DFSPH参数
     DFSPH_MIN_ITERATIONS = 2
@@ -91,6 +122,40 @@ class Config:
     DFSPH_MAX_ERROR = 0.05
     DFSPH_MAX_ITERATIONS_V = 50
     DFSPH_MAX_ERROR_V = 0.1
+
+    # Taichi 后端的流体材质参数。
+    # 【为什么必须显式写出来】_build_scene() 只下发 Configuration 段，
+    # 下面三个值原本是 DFSPHSolver/SPHBase 的构造默认（DFSPH.py 构造函数、
+    # sph_base.py），scene dict 里没有对应 key，调用方无从配置——
+    # 出问题只能去改求解器源码。
+    #
+    # 粘性 viscosity：显式格式，稳定性上限直接受时间步长约束。实测
+    #   同一灌注（8000 粒子，dt=0.003）峰值 |v|：
+    #     0.01 → 2.49 m/s（稳）   0.03 → 1.5e5 m/s（炸）   0.1 → 3.3e5（炸）
+    #   即 0.01 已是当前步长下的可用上限，不能为了"更黏"直接调大。
+    #   上游 SPlisHSPlasH dam-break 场景同样用 0.01。
+    VISCOSITY = 0.01
+
+    # 边界粘性（Akinci2012 的壁面 no-slip 项）。
+    # 【这是"粒子很轻、一点力就到处窜"的直接原因】该分支原本硬编码
+    # boundary_viscosity = 0.0，壁面完全无粘（free-slip）。流体-流体粘性只在
+    # 支撑半径内有邻居时才有效，而默认点击量是 8 个粒子（2x2x2），彼此很快
+    # 散开失去耦合 → 整团水在无摩擦地面上滑行/弹跳，永远不停。
+    # 实测（同一提交，仅改这个系数；每个配置独立进程跑）：
+    #              S1 8粒子静置(200帧)          S2 8000粒子灌注
+    #   bv=0.0   mean|v|=0.695 足迹1.523m         t=2s mean=0.243 >0.3速占31.3%
+    #            后续100帧漂移 0.817m(仍滑行)     t=4s mean=0.035（勉强停）
+    #   bv=0.005 mean|v|=0.0066 足迹0.078m        t=2s mean=0.018 >0.3速占 0.0%
+    #            后续100帧漂移 0.0007m(静止)      t=4s mean=0.006
+    #   bv=0.05  8粒子同样静止，但灌注 t=4s 残余 0.051（过阻尼抖动，未采用）
+    # 取 0.005：两个场景都干净收敛。上游 Viscosity_Standard.cpp 也有
+    # "viscosityBoundary" 参数（默认 0，因为它的示例用 Bender2019 体积图）。
+    BOUNDARY_VISCOSITY = 0.005
+
+    # 表面张力（内聚力项）。保持上游默认 0.01：实测在边界粘性修好后，
+    # 0.01/0.05/0.08 的静置收敛差别可以忽略（t=2s 均为 fast%≈0），
+    # 0.01 反而收敛更快（t=4s 残余 0.007 vs 0.011）。
+    SURFACE_TENSION = 0.01
     
     # 渲染参数
     # 容器改小之后相机要跟着靠近：原来 distance=10、target y=1.5 是为

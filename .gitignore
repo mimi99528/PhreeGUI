@@ -56,6 +56,9 @@ performance_report.txt
 sph_performance_detailed.txt
 sph_performance_comparison.png
 
+# Local tools (unrelated to simulation)
+excel_cell_reader/
+
 # Local AI tool config
 .continue/
 .kilo/

@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, Slot, QObject
 from PySide6.QtGui import QFont
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
-from ..core.mesh_system import MeshSystem
+from ..core.mesh_factory import create_mesh_system
 from ..renderer.opengl_renderer import OpenGLRenderer
 from ..utils.config import CONFIG
 from ..utils.helpers import get_system_stats_formatted
@@ -84,7 +84,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.mesh_system = MeshSystem()
+        self.mesh_system = create_mesh_system()
         self.opengl_renderer = OpenGLRenderer(self.mesh_system)
         self.is_running = False
         self.is_paused = False
@@ -1080,8 +1080,17 @@ class MainWindow(QMainWindow):
         if not self.is_running or self.is_paused:
             return
 
-        speed = self.speed_slider.value() / 10.0
-        dt = CONFIG.DEFAULT_TIME_STEP / speed
+        # 滑块 1..30 → 速度 0.1x..3.0x。原来写的是
+        #     dt = DEFAULT_TIME_STEP / speed
+        # 方向是反的：滑块拉到最左（"0.1x，最慢"）反而把步长放大到 0.03 s
+        # （10x），Taichi 后端拿这么大的步长直接发散（实测 1.5e4~2.7e4 m/s，
+        # 水充满容器）。速度倍率的含义是"每帧推进多少物理时间"，所以只能乘。
+        # 另外 Taichi 后端会把 dt 硬夹到 TAICHI_MAX_TIME_STEP（=DEFAULT_
+        # TIME_STEP），所以 >1.0x 的部分实际不会生效——这和 CPU 后端一致
+        # （CPU 路径本就忽略传入的 dt，恒用引擎内部步长）。要真正"更快"应该
+        # 走子步（每帧多跑几次 solver.step），而不是放大单个步长。
+        speed = max(0.1, min(3.0, self.speed_slider.value() / 10.0))
+        dt = CONFIG.DEFAULT_TIME_STEP * speed
 
         # Execute physics simulation
         t = time.perf_counter()

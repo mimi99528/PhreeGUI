@@ -17,6 +17,9 @@ Pillow>=9.0.0
 pysplishsplash>=2.10.0
 pysplashsurf>=0.10.0
 
+# GPU 物理后端（可选：PHREEGUI_PHYSICS_BACKEND=taichi 时需要）
+taichi>=1.7.0
+
 # 化学计算库
 phreeqcrm>=1.0.0
 

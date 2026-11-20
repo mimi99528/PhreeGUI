@@ -355,6 +355,10 @@ class CoupledSimulation:
         if self._particle_solutions is None:
             self._particle_solutions = np.zeros((n_rows, comps), dtype=np.float64)
             self._particle_solution_ready = np.zeros(n_rows, dtype=bool)
+            # 同一分支里必须把按 id 索引的单元归属也建出来：_update_particle_mapping
+            # 在"已有粒子时才 initialize"的路径上（重启/先点粒子再开始）会紧接着
+            # 写 _particle_cell_ids[ids]，早返回会留下 None 直接 TypeError。
+            self._particle_cell_ids = np.full(n_rows, -1, dtype=np.int32)
             _chem_logger.debug("创建粒子溶液数组: (%d, %d)", n_rows, comps)
             return
 
@@ -1234,14 +1238,19 @@ class CoupledSimulation:
             return None
         ph_col = headings.index('pH')
 
-        selected_output = np.asarray(self.rm.GetSelectedOutput(), dtype=np.float64)
-        if selected_output.ndim == 1:
-            selected_output = selected_output.reshape((-1, 1))
-        if selected_output.ndim != 2 or selected_output.shape[1] <= ph_col:
-            _chem_logger.error(
-                "SelectedOutput 形状异常: %s，无法按列 %r 取 pH",
-                selected_output.shape, 'pH')
+        # 【列主序修复】GetSelectedOutput() 返回的是一维数组，长度 =
+        # RowCount × ColumnCount，布局是"列在外层"：先 n_cells 个 pH、再
+        # n_cells 个 pe …… 直接 reshape((-1, 1)) 会把 8 列 × 1000 行读成
+        # 8000 行，随后"行数 != 单元总数"报错、pH 整条链路失效。
+        # 统一走 _selected_output_matrix()（同一处 reshape + 同一处形状校验）。
+        matrix, _heads = self._selected_output_matrix()
+        if matrix is None:
             return None
+        if ph_col >= matrix.shape[1]:
+            _chem_logger.error("SelectedOutput 矩阵列数 %d <= pH 列号 %d",
+                               matrix.shape[1], ph_col)
+            return None
+        selected_output = matrix
 
         # SelectedOutput 的行序约定 —— 已实测定死，不保留"两条都接受"的猜测分支。
         # 证据一（端到端 run9：真实 GUI 对象图、酸性流体、256 粒子、562 次采样，
@@ -1338,8 +1347,8 @@ class CoupledSimulation:
 
     # 溶质组分：H/O 是水本身的元素总量（110.68 / 55.35 mol/L），
     # 把它们画进"浓度分布"只会得到一整片饱和色，看不出任何反应。
-    # 真正的溶质是电荷载体 Cl/Na 这类组分。
-    _SOLUTE_COMPONENT_NAMES = ('Cl', 'Na', 'S', 'C', 'Ca', 'Mg', 'K', 'N')
+    # 真正的溶质是电荷载体 Cl/Na 这类组分。Fe 是氧化还原示例的主角。
+    _SOLUTE_COMPONENT_NAMES = ('Cl', 'Na', 'S', 'C', 'Fe', 'Ca', 'Mg', 'K', 'N')
 
     def get_solute_component_index(self) -> int:
         """返回"最值得画"的溶质组分列号；没有溶质时返回 0。
@@ -1369,7 +1378,9 @@ class CoupledSimulation:
         就是该竖直柱子里所有单元的溶质总量。
 
         Args:
-            kind: 'solute' = 溶质浓度柱积分；'ph' = 该柱子的 pH 极值。
+            kind: 'solute' = 溶质浓度柱积分；'ph' = 该柱子的 pH 极值；
+                  也可以是组分名（'C' / 'Fe' …）或 SelectedOutput 里的物种名
+                  （'Fe+2' / 'HCO3-' …），后两者都按柱积分显示。
                   pH 的极性必须按"最偏离中性"取（酸取最小、碱取最大），
                   否则一杯 pH 3 的酸被柱子里中性单元平均一下就变成 pH 6。
 
@@ -1400,6 +1411,19 @@ class CoupledSimulation:
             field2d[empty_col] = np.nan  # 整个竖直柱都没数据
             return field2d  # (iz, ix)
 
+        # 指定组分名：直接取该元素总量的柱积分（例如 'Fe' = 溶解态总铁）
+        if kind in self.comp_names:
+            idx = self.comp_names.index(kind)
+            grid = cell_conc[:, idx].reshape((n_dim, n_dim, n_dim))
+            return grid.sum(axis=1)
+
+        # 指定物种名：取 SelectedOutput 的 -molalities 列（例如 'Fe+2'）
+        species_flat = self._cell_species_map(kind)
+        if species_flat is not None:
+            grid = species_flat.reshape((n_dim, n_dim, n_dim))
+            # 未参与本步化学的单元是 NaN，按 0 计，避免整柱因一格没数据变 NaN
+            return np.nansum(grid, axis=1)
+
         idx = self.get_solute_component_index()
         if idx < 0:
             return None
@@ -1407,46 +1431,96 @@ class CoupledSimulation:
         # 沿 Y（轴 1）求和 => (iz, ix)：正好是"俯视 X-Z 平面"的显示方向
         return grid.sum(axis=1)
 
+    def _selected_output_matrix(self):
+        """返回 ((n_cells, n_cols) 矩阵, headings)；不可用时 (None, None)。
+
+        实测（_probe_chem_species10）：GetSelectedOutput() 返回的是**列主序**
+        一维数组 —— 先是 n_cells 个 pH、再是 n_cells 个 pe …… 长度 =
+        n_cells × n_cols。原来 _cell_ph_map 把它 reshape 成 (N,1) 再取
+        [:n_cells, 0]，只因 pH 恰好是第 0 列才碰巧正确。加入 -pe / -molalities
+        之后必须按行列数还原，否则取到的会是错列。
+        """
+        if self.rm is None:
+            return None, None
+        try:
+            if int(self.rm.GetSelectedOutputCount()) <= 0:
+                return None, None
+            headings = [str(h) for h in self.rm.GetSelectedOutputHeadings()]
+            raw = np.asarray(self.rm.GetSelectedOutput(), dtype=np.float64)
+        except Exception as e:
+            _chem_logger.error("读取 SelectedOutput 失败: %r", e)
+            return None, None
+
+        n_cells = self.chem_field.n_cells
+        n_h = len(headings)
+
+        # 形状一：二维数组（部分封装版本直接返回 (rows, cols)）。
+        # 只要第一维就是单元数，就是行主序矩阵，直接用。
+        if raw.ndim == 2:
+            if raw.shape[0] == n_cells and raw.shape[1] == n_h:
+                return raw, headings
+            if raw.shape[1] == n_cells and raw.shape[0] == n_h:
+                return raw.T, headings
+            _chem_logger.error(
+                "SelectedOutput 二维形状 %s 与化学网格(%d 单元, %d 列)不符；"
+                "本帧按无数据处理（决策 D4）", raw.shape, n_cells, n_h)
+            return None, None
+
+        # 形状二（实测 PhreeqcRM 0.0.17）：列主序一维数组，
+        # 长度 = RowCount × ColumnCount。行列数必须来自 API。
+        try:
+            n_rows = int(self.rm.GetSelectedOutputRowCount())
+            n_cols = int(self.rm.GetSelectedOutputColumnCount())
+        except Exception as e:
+            _chem_logger.error("读取 SelectedOutput 行列数失败: %r", e)
+            return None, None
+        if n_rows != n_cells or n_cols != n_h:
+            _chem_logger.error(
+                "SelectedOutput 形状不符: rows=%d cols=%d headings=%d，"
+                "化学网格=%d 单元；本帧按无数据处理（决策 D4）",
+                n_rows, n_cols, n_h, n_cells)
+            return None, None
+        if raw.size != n_rows * n_cols:
+            _chem_logger.error(
+                "SelectedOutput 长度 %d != %d×%d", raw.size, n_rows, n_cols)
+            return None, None
+        return raw.reshape((n_cols, n_rows)).T, headings
+
     def _cell_ph_map(self) -> Optional[np.ndarray]:
         """(n_cells,) 的单元 pH 场；未参与本步化学的单元是 NaN。
 
         直接复用 get_particle_ph 的同一份 SelectedOutput + 掩码逻辑，
         但按"单元"口径返回，而不是按粒子重排——分布图要的是场，不是粒子。
         """
-        if self.rm is None:
+        matrix, headings = self._selected_output_matrix()
+        if matrix is None or 'pH' not in headings:
             return None
-        try:
-            n_sel = int(self.rm.GetSelectedOutputCount())
-            if n_sel <= 0:
-                return None
-            headings = [str(h) for h in self.rm.GetSelectedOutputHeadings()]
-        except Exception as e:
-            _chem_logger.error("读取 SelectedOutput 表头失败，pH 场不可用: %r", e)
-            return None
-        if 'pH' not in headings:
-            return None
-        ph_col = headings.index('pH')
-
-        try:
-            selected_output = np.asarray(self.rm.GetSelectedOutput(), dtype=np.float64)
-        except Exception as e:
-            _chem_logger.error("读取 SelectedOutput 失败，pH 场不可用: %r", e)
-            return None
-        if selected_output.ndim == 1:
-            selected_output = selected_output.reshape((-1, 1))
-
-        n_cells = self.chem_field.n_cells
-        if selected_output.shape[0] < n_cells or selected_output.shape[1] <= ph_col:
-            return None
-
-        ph = np.array(selected_output[:n_cells, ph_col], dtype=np.float64, copy=True)
+        ph = np.array(matrix[:, headings.index('pH')], dtype=np.float64, copy=True)
         mask = self._chem_mapped_mask
-        if mask is not None and mask.shape[0] == n_cells:
+        if mask is not None and mask.shape[0] == ph.size:
             ph[~mask] = np.nan
         else:
             ph[~(ph > 0.0)] = np.nan
         ph[np.isinf(ph)] = np.nan
         return ph
+
+    def _cell_species_map(self, species_name: str) -> Optional[np.ndarray]:
+        """(n_cells,) 的指定物种 molality 场；列名形如 m_Fe+2(mol/kgw)。"""
+        matrix, headings = self._selected_output_matrix()
+        if matrix is None:
+            return None
+        prefix = "m_" + str(species_name) + "("
+        col = next((i for i, h in enumerate(headings) if h.startswith(prefix)), None)
+        if col is None:
+            _chem_logger.debug(
+                "SelectedOutput 里没有物种 %r（现有列: %s）", species_name, headings)
+            return None
+        vals = np.array(matrix[:, col], dtype=np.float64, copy=True)
+        mask = self._chem_mapped_mask
+        if mask is not None and mask.shape[0] == vals.size:
+            vals[~mask] = np.nan
+        vals[np.isinf(vals)] = np.nan
+        return vals
 
 
     def force_update_mapping(self) -> None:
