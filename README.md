@@ -32,7 +32,7 @@ pip install -r requirements.txt
 - 非 win_amd64 / CPython 3.12 平台：按同一补丁自行编译，或使用原版并把 `DEFAULT_NTHREADS` 设为 1。
 
 ## 🚀 快速开始
-打开launch_coupled_simulation.py，点击开始模拟，你可以在右边的3d显示窗口看到模拟状态，使用左键来创建粒子，右键移动摄像机。
+打开coupled_chemistry_physics_gui.py，点击开始模拟，你可以在右边的3d显示窗口看到模拟状态，使用左键来创建粒子，右键移动摄像机。
 
 ### 物理后端切换（CPU / Taichi GPU）
 
