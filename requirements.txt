@@ -17,11 +17,11 @@ Pillow>=9.0.0
 pysplishsplash>=2.10.0
 pysplashsurf>=0.10.0
 
-# GPU 物理后端（可选：PHREEGUI_PHYSICS_BACKEND=taichi 时需要）
+# GPU 物理后端（默认后端；只用 PHREEGUI_PHYSICS_BACKEND=cpu 时可删）
 taichi>=1.7.0
 
-# 化学计算库
-phreeqcrm>=1.0.0
+# 化学计算库（使用 wheels/ 里的线程修复版；换回 PyPI 原版须把 DEFAULT_NTHREADS 改回 1）
+phreeqcrm==0.0.20
 
 # 并行计算和多进程
 multiprocess>=0.70.14

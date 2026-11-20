@@ -1,0 +1,229 @@
+--- a/src/PhreeqcRM.cpp
++++ b/src/PhreeqcRM.cpp
+@@ -1777,13 +1777,10 @@
+ 			}
+ 		}
+ #else
+-		if (this->nthreads > this->count_chemistry)
+-		{
+-			std::ostringstream err;
+-			err << "Number of threads must be less than or equal to number of reaction cells, ";
+-			err << this->count_chemistry << "." << std::endl;
+-			this->ErrorHandler(IRM_FAIL, err.str());
+-		}
++		// Fewer reaction cells than threads is legal here: SetEndCells leaves the
++		// surplus workers with empty ranges, and RebalanceLoad/RebalanceLoadPerCell
++		// already return early when nthreads > count_chemistry. MPI still needs the
++		// check above because every rank must own at least one cell.
+ #endif
+ 
+ 
+@@ -3638,7 +3635,17 @@
+ 			{
+ 				// load fractions into d
+ 				cxxsoln_ptr = this->GetWorkers()[n]->Get_solution(j);
+-				assert (cxxsoln_ptr);
++				if (cxxsoln_ptr == NULL)
++				{
++					// The worker does not hold the cell it was assigned. Dereferencing
++					// here is a segfault in release builds, where assert is compiled out.
++					std::ostringstream estrm;
++					estrm << "Worker " << n << " (cells " << this->start_cell[n] << "-"
++						<< this->end_cell[n] << ") does not hold chemistry cell " << j << "." << std::endl;
++					this->ErrorMessage(estrm.str().c_str());
++					return_value = IRM_FAIL;
++					continue;
++				}
+ 				double v, dens;
+ 				if (this->use_solution_density_volume)
+ 				{
+@@ -10271,9 +10278,9 @@
+ 	IPhreeqcPhast *phast_iphreeqc_worker = this->GetWorkers()[n];
+ 	IRM_RESULT return_value = IRM_OK;
+ 
+-#if defined(USE_OPENMP) && defined(swig_python_EXPORTS)
+-	PyGILState_STATE gstate = PyGILState_Ensure();
+-#endif
++	// No GIL is held here. RunCells releases it around the OpenMP region, and the
++	// only Python reachable from a worker (basic_callback_shim) takes it per call.
++	// Holding it across the whole chemistry run serializes every worker.
+ 
+ 	try
+ 	{
+@@ -10576,9 +10583,6 @@
+ 		this->ErrorMessage(e_stream.str());
+ 		return_value = IRM_FAIL;
+ 	}
+-#if defined(USE_OPENMP) && defined(swig_python_EXPORTS)
+-	PyGILState_Release(gstate);
+-#endif
+ 	return return_value;
+ }
+ /* ---------------------------------------------------------------------- */
+@@ -11706,6 +11710,51 @@
+ #else
+ 	int ntasks = this->nthreads;
+ #endif
++#ifndef USE_MPI
++	// Refresh the ownership record from the partition, which is authoritative for
++	// the cells it covers (RebalanceLoadPerCell commits its ranges after moving
++	// cells). The record is never shrunk: count_chemistry may fall and later rise
++	// again, and cells above the current range still exist in their old worker.
++	int covered = 0;
++	if ((int) this->start_cell.size() == ntasks && (int) this->end_cell.size() == ntasks
++		&& ntasks > 0)
++	{
++		covered = this->end_cell[ntasks - 1] + 1;
++	}
++	int need = this->count_chemistry > covered ? this->count_chemistry : covered;
++	if ((int) this->cell_owner.size() < need) this->cell_owner.resize(need, -1);
++	for (int n = 0; n < ntasks && covered > 0; n++)
++	{
++		for (int k = this->start_cell[n]; k <= this->end_cell[n]; k++)
++		{
++			if (k >= 0 && k < (int) this->cell_owner.size()) this->cell_owner[k] = n;
++		}
++	}
++#endif
++	// RebalanceLoadPerCell relocates chemistry cells between workers and commits
++	// the resulting ranges. Recomputing an even partition here would strand those
++	// cells in their old worker, so keep any partition that still covers
++	// count_chemistry exactly once. Empty ranges (start == end + 1) are valid:
++	// they occur when count_chemistry < nthreads.
++	if ((int) this->start_cell.size() == ntasks && (int) this->end_cell.size() == ntasks
++		&& this->start_cell[0] == 0
++		&& this->end_cell[ntasks - 1] == this->count_chemistry - 1)
++	{
++		bool usable = true;
++		for (int i = 0; i < ntasks; i++)
++		{
++			if (this->start_cell[i] > this->end_cell[i] + 1
++				|| (i > 0 && this->start_cell[i] != this->end_cell[i - 1] + 1))
++			{
++				usable = false;
++				break;
++			}
++		}
++		if (usable)
++		{
++			return;
++		}
++	}
+ 	int n = this->count_chemistry / ntasks;
+ 	int extra = this->count_chemistry - n*ntasks;
+ 	std::vector<int> cells;
+@@ -11726,6 +11775,69 @@
+ 		this->end_cell.push_back(cell0 + cells[i] - 1);
+ 		cell0 = cell0 + cells[i];
+ 	}
++#ifndef USE_MPI
++	// Recomputing the ranges does not move the chemistry cells: they stay in the
++	// worker that created them. CreateMapping may change count_chemistry, after
++	// which a worker's range names cells it does not hold, and
++	// Concentrations2Solutions silently skips those (if (soln_ptr) Update).
++	// Relocate so ownership matches the partition, batching each worker pair into
++	// one storage bin and one DELETE as InitialPhreeqc2Module does.
++	//
++	// The source must be the recorded owner, not any worker holding a solution at
++	// that key: RunString broadcasts SOLUTION definitions to every worker, and
++	// those low keys survive as un-equilibrated templates in workers that never
++	// owned the cell. Copying one would overwrite the real chemistry.
++	std::vector<int> source_worker(this->count_chemistry, -1);
++	for (int k = 0; k < this->count_chemistry; k++)
++	{
++		int owner = k < (int) this->cell_owner.size() ? this->cell_owner[k] : -1;
++		if (owner < 0)
++		{
++			// Never partitioned, so no record exists; take the first holder.
++			for (int w = 0; w < ntasks; w++)
++			{
++				if (this->GetWorkers()[w]->Get_solution(k) != NULL) { owner = w; break; }
++			}
++		}
++		source_worker[k] = owner;
++	}
++	for (int src = 0; src < ntasks; src++)
++	{
++		for (int dst = 0; dst < ntasks; dst++)
++		{
++			if (src == dst) continue;
++			cxxStorageBin temp_bin;
++			std::ostringstream delete_command;
++			delete_command << "DELETE; -cells\n";
++			int nmoved = 0;
++			for (int k = this->start_cell[dst]; k <= this->end_cell[dst]; k++)
++			{
++				if (source_worker[k] != src) continue;
++				if (this->GetWorkers()[src]->Get_solution(k) == NULL) continue;
++				this->GetWorkers()[src]->Get_PhreeqcPtr()->phreeqc2cxxStorageBin(temp_bin, k);
++				delete_command << k << "\n";
++				nmoved++;
++				if (this->partition_uz_solids)
++				{
++					this->GetWorkers()[dst]->uz_bin.Add(this->GetWorkers()[src]->uz_bin, k);
++					this->GetWorkers()[src]->uz_bin.Remove(k);
++				}
++			}
++			if (nmoved == 0) continue;
++			this->GetWorkers()[dst]->Get_PhreeqcPtr()->cxxStorageBin2phreeqc(temp_bin);
++			int status = this->GetWorkers()[src]->RunString(delete_command.str().c_str());
++			if (status != 0)
++			{
++				this->ErrorMessage(this->GetWorkers()[src]->GetErrorString());
++			}
++		}
++	}
++	for (int n = 0; n < ntasks; n++)
++	{
++		this->GetWorkers()[n]->Set_start_cell(this->start_cell[n]);
++		this->GetWorkers()[n]->Set_end_cell(this->end_cell[n]);
++	}
++#endif
+ }
+ /* ---------------------------------------------------------------------- */
+ void
+--- a/src/PhreeqcRM.h
++++ b/src/PhreeqcRM.h
+@@ -5880,6 +5880,9 @@
+ 
+ 	std::vector< int > start_cell;
+ 	std::vector< int > end_cell;
++	// Worker that holds each chemistry cell. Outlives start_cell/end_cell, which
++	// shrink with count_chemistry; cells above the current range still exist.
++	std::vector< int > cell_owner;
+ 	// reactant lists
+ 	std::vector <std::string> ExchangeSpeciesNamesList;
+ 	std::vector <std::string> ExchangeNamesList;
+--- a/swig/PhreeqcRM.i
++++ b/swig/PhreeqcRM.i
+@@ -248,12 +248,12 @@
+     PhreeqcRM::PythonMpiWorkerCallbackData* callback_data = (PhreeqcRM::PythonMpiWorkerCallbackData*)cookie;
+ 
+     int result_val = 0;
++    PyGILState_STATE gil = PyGILState_Ensure();
+     PyObject* pyfunc = callback_data->py_callable;
+     if (!pyfunc || !PyCallable_Check(pyfunc)) {
++        PyGILState_Release(gil);
+         return result_val;
+     }
+-    
+-    PyGILState_STATE gil = PyGILState_Ensure();
+ 
+     PyObject* args = Py_BuildValue("(iO)", *method, callback_data->py_callback_cookie);
+     if (args) {
+@@ -311,13 +311,13 @@
+     PhreeqcRM::PythonBasicCallbackData* callback_data = (PhreeqcRM::PythonBasicCallbackData*)cookie;
+ 
+     double result_val = 0.0;
++    PyGILState_STATE gil = PyGILState_Ensure();
+     PyObject* pyfunc = callback_data->py_callable;
+     if (!pyfunc || !PyCallable_Check(pyfunc)) {
++        PyGILState_Release(gil);
+         return result_val;
+     }
+ 
+-    PyGILState_STATE gil = PyGILState_Ensure();
+-
+     PyObject* args = Py_BuildValue("(ddsO)", val1, val2, message, callback_data->py_callback_cookie);
+     if (args) {
+         PyObject* res = PyObject_CallObject(pyfunc, args);

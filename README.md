@@ -17,28 +17,35 @@
 
 ## 📦 安装
 
-确保你安装了 [依赖环境]。
+先装仓库内置的 PhreeqcRM 线程修复版 wheel，再装其余依赖：
 
 ```bash
+pip install wheels/phreeqcrm-0.0.20-cp312-cp312-win_amd64.whl
 pip install -r requirements.txt
 ```
+
+为什么需要这个 wheel：
+
+- PyPI 原版 PhreeqcRM 0.0.20 在 `nthreads > 1` 时会在 `RunCells` 内段错误（Windows 退出码 139），原因见 [`wheels/phreeqcrm-thread-fix.v3.patch`](./wheels/phreeqcrm-thread-fix.v3.patch)（改 `PhreeqcRM.cpp` / `PhreeqcRM.h` / `swig/PhreeqcRM.i`）。
+- 本仓库 wheel 的 SHA-256：`af958509ae9403f648bbf342008eb139912a0f0cb1a8b9499dfa98b9188f8062`（win_amd64 + CPython 3.12）。
+- 若换回 PyPI 原版 wheel，必须把 `phreeqc_config.DEFAULT_NTHREADS` 改回 `1`，否则多线程化学步会直接崩溃。
+- 非 win_amd64 / CPython 3.12 平台：按同一补丁自行编译，或使用原版并把 `DEFAULT_NTHREADS` 设为 1。
 
 ## 🚀 快速开始
 打开launch_coupled_simulation.py，点击开始模拟，你可以在右边的3d显示窗口看到模拟状态，使用左键来创建粒子，右键移动摄像机。
 
 ### 物理后端切换（CPU / Taichi GPU）
 
-默认使用 SPlisHSPlasH CPU 版 DFSPH。启用 Taichi GPU 后端：
+默认使用 Taichi GPU 版 DFSPH（未装 `taichi` 或 CUDA 不可用时会直接报错）。切回 SPlisHSPlasH CPU 版：
 
 ```bash
-# 需要先安装：pip install "taichi>=1.7"
-PHREEGUI_PHYSICS_BACKEND=taichi PHREEGUI_TAICHI_ARCH=cuda python launch_coupled_simulation.py
+PHREEGUI_PHYSICS_BACKEND=cpu python launch_coupled_simulation.py
 ```
 
 | 变量 | 取值 | 说明 |
 |---|---|---|
-| `PHREEGUI_PHYSICS_BACKEND` | `cpu`（默认）/ `taichi` | 物理求解器实现 |
-| `PHREEGUI_TAICHI_ARCH` | `cuda`（默认）/ `cpu` | Taichi 执行后端 |
+| `PHREEGUI_PHYSICS_BACKEND` | `taichi`（默认）/ `cpu` | 物理求解器实现 |
+| `PHREEGUI_TAICHI_ARCH` | `cuda`（默认）/ `cpu` | Taichi 执行后端（仅 `taichi` 后端有效） |
 
 注意：
 - 两个后端边界模型不同（CPU=Bender2019 体积图，Taichi=Akinci2012 边界粒子），数值不会逐位一致；化学耦合只依赖 (位置, 稳定粒子 id)，契约相同。
