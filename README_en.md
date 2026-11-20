@@ -18,12 +18,13 @@ Aiming to solve the **"impossible triangle"** of current chemical simulation sof
 Ensure you have the required dependencies installed (Python 3.8+, etc.).
 
 ```bash
+pip install wheels/phreeqcrm-0.0.20-cp312-cp312-win_amd64.whl
 pip install -r requirements.txt
 ```
 
 ## 🚀 Quick Start
 
-1. Open `launch_coupled_simulation.py`
+1. Open `coupled_chemistry_physics_gui.py`
 2. Click **"Start Simulation"**
 3. View the simulation status in the **3D viewport** on the right
    - 🖱️ **Left-click**: Create particles
