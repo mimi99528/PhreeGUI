@@ -61,6 +61,7 @@ PHREEGUI_PHYSICS_BACKEND=cpu python launch_coupled_simulation.py
 - 🤖 [GitHub Copilot](https://github.com/features/copilot)
 - 🧠 [通义千问 (Qwen)](https://tongyi.aliyun.com/)
 - 🌕 [Kimi Ai](https://kimi.moonshot.cn/)
+- 🐋 [deepseek](https://www.deepseek.com/)
 
 感谢这些强大的 AI 结对程序员，让创意能更快地转化为代码！
 
